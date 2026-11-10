@@ -66,7 +66,7 @@ bash scripts/vps-sentinel-install.sh <凭据别名> --home-ip <你家宽出口IP
 bash scripts/vps-automation-spec.sh <凭据别名> --json
 ```
 
-凭据统一落在 `~/.vps-node/<别名>.json`（权限 600），后续所有脚本都从这里读参数——**换机器只需换这个文件**。
+凭据统一落在 `~/.vps-node/<别名>.json`（权限 600），后续所有脚本都从这里读参数——**换机器只需换这个文件**。 字段模板见 `references/creds.example.json`（全是占位符，不要把真实凭据放进仓库）。
 
 ## 设计要点
 

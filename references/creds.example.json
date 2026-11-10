@@ -1,0 +1,17 @@
+{
+  "ip": "203.0.113.10",
+  "fqdn": "your-node.example.com",
+  "sub_url": "https://your-node.example.com:2096/<SUB_TOKEN>.yaml",
+  "uuid": "00000000-0000-0000-0000-000000000000",
+  "reality_pub": "<REALITY_PUBLIC_KEY>",
+  "short_id": "<SHORT_ID>",
+  "dest": "www.example.com",
+  "hy2_pass": "<HY2_PASSWORD>",
+  "singbox": "ok",
+  "subsvc": "ok",
+  "sub_http": 200,
+  "ssh_port": 22,
+  "home_ip": "192.0.2.10",
+  "deploy_date": "2026-01-01",
+  "egress_ip": "198.51.100.20"
+}

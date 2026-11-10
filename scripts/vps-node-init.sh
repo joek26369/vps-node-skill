@@ -2,7 +2,7 @@
 # ============================================================================
 # VPS 节点初始化（在 VPS 上以 root 运行）
 # 用法: bash vps-node-init.sh <公网IP> <duckdns子域名> <duckdns_token> [dest域名]
-# 示例: bash vps-node-init.sh 1.2.3.4 mynode a1b2c3-... www.paypal.com
+# 示例: bash vps-node-init.sh 203.0.113.10 <YOUR_DUCKDNS_SUB> <YOUR_DUCKDNS_TOKEN> www.example.com
 # 功能: BBR + sing-box(REALITY 443 + Hysteria2 8443) + Let's Encrypt(DNS-01)
 #       + HTTPS 订阅端点(:2096，token 路径) + 自动续期
 # 输出: 末尾打印 VPS_RESULT_JSON={...} 供编排器解析

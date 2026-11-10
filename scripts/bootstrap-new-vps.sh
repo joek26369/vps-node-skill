@@ -4,7 +4,7 @@
 # 用法:
 #   bash bootstrap-new-vps.sh <IP> <SSH端口> <root密码> <duckdns子域名> <duckdns_token> [dest]
 # 示例:
-#   bash bootstrap-new-vps.sh 1.2.3.4 2222 'MyP@ss' <YOUR_DUCKDNS_SUB> <YOUR_DUCKDNS_TOKEN>
+#   bash bootstrap-new-vps.sh 203.0.113.10 2222 'CHANGE_ME' <YOUR_DUCKDNS_SUB> <YOUR_DUCKDNS_TOKEN>
 #
 # 前提:
 #   - duckdns.org 已登录，且已在 Domains 框添加了 <duckdns子域名>

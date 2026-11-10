@@ -95,7 +95,7 @@ TARGET=<家宽出口IP> bash scripts/vps-precheck.sh <IP> <SSH_PORT> '<ROOT_PASS
 
 | 参数 | 说明 | 必填 |
 |---|---|---|
-| `DUCKDNS_SUB` | DuckDNS 子域名前缀，如 `<YOUR_DUCKDNS_SUB>`（**不要**带 `.duckdns.org`） | ✅ |
+| `DUCKDNS_SUB` | DuckDNS 子域名前缀，如 `your-node`（**不要**带 `.duckdns.org`） | ✅ |
 | `DUCKDNS_TOKEN` | DuckDNS 账户 token | ✅ |
 | `DEST` | REALITY 借壳站点，默认 `www.paypal.com` | 可选 |
 
@@ -120,7 +120,7 @@ bash ~/.workbuddy/skills/vps-node/scripts/bootstrap-new-vps.sh \
 
 ```bash
 # 把家宽出口 IP 加进 fail2ban 白名单（避免自己误封）
-WHITELIST_IP=1.2.3.4 bash bootstrap-new-vps.sh ...
+WHITELIST_IP=192.0.2.10 bash bootstrap-new-vps.sh ...
 
 # 跳过系统补丁升级（快约 2 分钟，但会留待装补丁）
 HARDEN_UPGRADE=0 bash bootstrap-new-vps.sh ...

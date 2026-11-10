@@ -2,7 +2,7 @@
 # ============================================================================
 # VPS 安全加固（P0-P4）
 # P0 ufw 防火墙 / P1 系统补丁 / P2 SSH 收敛 / P3 sysctl 网络加固 / P4 fail2ban
-# 用法: SSH_PORT=22 WHITELIST_IP=1.2.3.4 bash vps-harden.sh [--no-upgrade]
+# 用法: SSH_PORT=22 WHITELIST_IP=192.0.2.10 bash vps-harden.sh [--no-upgrade]
 # 特性: 幂等；防火墙先放行 SSH 再启用（防自锁）；每步有校验输出
 # ============================================================================
 set -uo pipefail

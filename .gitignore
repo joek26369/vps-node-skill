@@ -5,3 +5,12 @@
 .vps-node/
 __pycache__/
 *.pyc
+*.env
+!.env.example
+node-secrets.env
+creds.json
+.gateway.json
+*.pem
+*.key
+id_ed25519*
+id_rsa*
