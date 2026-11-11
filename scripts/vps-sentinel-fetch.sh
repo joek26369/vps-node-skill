@@ -13,23 +13,26 @@
 #   --json      机读输出（automation 判断用）
 #   --full      展开每一条异常原始记录（默认只给聚合摘要）
 #   --no-local  跳过本机真实探测（只分析远端日志）
-#   --days N    只看最近 N 天，默认全部
+#   --risk      本机探测附带 IP 风险复检（透传给 vps-sentinel.sh --risk）
+#   --days N    只看最近 N 天，默认 1（日检只对最近 24h 定级）；0 = 全部
 #
 # 退出码: 0 正常 / 1 警告 / 2 严重
 # ============================================================================
 set -uo pipefail
 
 ARG="${1:-}"
-[ -n "$ARG" ] || { echo "用法: vps-sentinel-fetch.sh <凭据别名 | creds.json | IP> [--json] [--full] [--no-local] [--days N]"; exit 1; }
+[ -n "$ARG" ] || { echo "用法: vps-sentinel-fetch.sh <凭据别名 | creds.json | IP> [--json] [--full] [--no-local] [--risk] [--days N]"; exit 1; }
 shift || true
 
-JSONOUT=0; FULL=0; DOLOCAL=1; DAYS=0
+JSONOUT=0; FULL=0; DOLOCAL=1; DAYS=1; RISKARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --json)     JSONOUT=1; shift ;;
     --full)     FULL=1; shift ;;
     --no-local) DOLOCAL=0; shift ;;
-    --days)     DAYS="${2:-0}"; shift 2 ;;
+    --risk)     RISKARG="--risk"; shift ;;
+    --days)     DAYS="${2:-1}"; shift 2
+                case "$DAYS" in ''|*[!0-9]*) echo "--days 需要非负整数"; exit 1 ;; esac ;;
     *) echo "未知选项: $1"; exit 1 ;;
   esac
 done
@@ -91,8 +94,8 @@ fi
 # ---- 本机真实探测（能看国内 → VPS 的唯一视角）----
 LOCAL_JSON=""
 if [ "$DOLOCAL" = "1" ]; then
-  LOCAL_JSON=$(bash "$HERE/vps-sentinel.sh" "$ALIAS" --json 2>/dev/null || true)
-  [ -z "$LOCAL_JSON" ] && LOCAL_JSON=$(bash "$HERE/vps-sentinel.sh" "$IP" --json 2>/dev/null || true)
+  LOCAL_JSON=$(bash "$HERE/vps-sentinel.sh" "$ALIAS" --json $RISKARG 2>/dev/null || true)
+  [ -z "$LOCAL_JSON" ] && LOCAL_JSON=$(bash "$HERE/vps-sentinel.sh" "$IP" --json $RISKARG 2>/dev/null || true)
 fi
 
 # ---- 分析 ----
@@ -155,7 +158,7 @@ def add(kind, level, detail, t):
 
 if not rows:
     out = {"name": name, "samples": 0, "level": 1,
-           "issues": ["服务端日志为空：确认已装 cron（/etc/cron.d/vps-sentinel）"]}
+           "issues": ["服务端日志为空（或 --days 窗口内无样本）：确认已装 cron（/etc/cron.d/vps-sentinel）"]}
     if jsonout:
         print(json.dumps(out, ensure_ascii=False))
     else:
@@ -204,10 +207,10 @@ for v, (ft, lt, c) in eg_vals.items():
 cert_v = [r["cert"] for r in rows if isinstance(r.get("cert"), int)]
 sub_v = [(r["ts"], str(r.get("sub") or "")) for r in rows if r.get("sub")]
 for t, v in sub_v:
-    if v not in ("200", "0", ""):
-        add("sub_http", 2, f"订阅本地自取 HTTP {v}", t)
-    elif v == "000":
+    if v == "000":
         add("sub_http", 2, "订阅本地自取失败（000）", t)
+    elif v not in ("200", "0", ""):
+        add("sub_http", 2, f"订阅本地自取 HTTP {v}", t)
 
 # 落地风控
 land_v = {}

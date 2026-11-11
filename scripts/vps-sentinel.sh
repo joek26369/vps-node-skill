@@ -5,7 +5,9 @@
 #   默认   : 服务端存活 + 双协议延迟 + 出口 IP + 证书剩余天数
 #   --risk : 额外做 IP 风险复检（proxycheck + Scamalytics Fraud Score）
 #   --json : 机读输出（automation 判断用），与人类输出二选一
-# 退出码: 0 正常 / 1 警告 / 2 严重（出口 IP 变更或服务端不可达）
+# 退出码: 0 正常 / 1 警告 / 2 严重（服务端不可达 / sing-box 未运行）
+# 注: 出口 IP 经本机 Clash「当前选中」的节点测得，选的不是本节点时会不一致，
+#     所以这里只记警告；出口真被换掉由服务端哨兵（vps-sentinel-fetch.sh）判严重
 # ============================================================================
 set -uo pipefail
 ARG="${1:?用法: vps-sentinel.sh <VPS_IP | creds.json> [--json] [--risk]}"
@@ -47,6 +49,7 @@ PORT="${SSH_PORT:-}"
 [ -n "$CREDS" ] && [ -z "$PORT" ] && PORT=$(J ssh_port)
 
 # ---- SSH 密钥自动探测：统一约定键 → 别名键 → 泛化 → 通用默认 ----
+KEYARG=()
 for k in "$HOME/.ssh/id_ed25519_vps" "$HOME/.ssh/id_ed25519_${ALIAS:-}" \
          "$HOME/.ssh/id_ed25519_${FQDN%%.*}" "$HOME"/.ssh/id_ed25519_* \
          "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
@@ -54,9 +57,8 @@ for k in "$HOME/.ssh/id_ed25519_vps" "$HOME/.ssh/id_ed25519_${ALIAS:-}" \
   case "$k" in *.pub) continue ;; esac
   KEYARG=(-i "$k"); break
 done
-# 保证数组非空，避免 bash 3.2 + set -u 下展开报 unbound
-[ ${#KEYARG[@]} -eq 0 ] && KEYARG=()
-SSHOPT=("${KEYARG[@]}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+# bash 3.2 + set -u 下空数组 "${a[@]}" 会报 unbound，用 ${a[@]+...} 展开
+SSHOPT=(${KEYARG[@]+"${KEYARG[@]}"} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=15 -o BatchMode=yes -o LogLevel=ERROR)
 
 # 端口：凭据里没有就试 22 / 2222
@@ -182,7 +184,9 @@ case ",$EGRESS_EXPECTED," in
   *",$EGRESS,"*) EGRESS_OK=1 ;;
 esac
 if [ -n "$EGRESS" ] && [ "$EGRESS_OK" = "0" ]; then
-  LVL=2; ISSUES+=("出口 IP 变为 ${EGRESS}（应为 ${EGRESS_EXPECTED}）")
+  # 本机视角依赖 Clash 当前选中的节点，不能据此判严重
+  [ "$LVL" -lt 1 ] && LVL=1
+  ISSUES+=("经本机 Clash 的出口为 ${EGRESS}（预期 ${EGRESS_EXPECTED}）：先确认 Clash 当前选中的是本节点；服务端出口以哨兵日志为准")
 fi
 if [ -n "$CERTDAYS" ] && [ "$CERTDAYS" -lt 14 ] 2>/dev/null; then
   [ "$LVL" -lt 1 ] && LVL=1; ISSUES+=("证书仅剩 ${CERTDAYS} 天")
