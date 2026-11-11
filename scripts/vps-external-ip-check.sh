@@ -9,6 +9,9 @@
 # ============================================================================
 IP="${1:?用法: vps-external-ip-check.sh <IP> [端口] [--no-proxy]}"
 PORT="${2:-80}"
+# 只接受 IPv4 字面量：$IP 会进 URL 与 python -c 字符串
+case "$IP" in ''|*[!0-9.]*) echo "不是合法 IPv4: $IP"; exit 2 ;; esac
+case "$PORT" in ''|*[!0-9]*) echo "端口不合法: $PORT"; exit 2 ;; esac
 NOPROXY=0
 for a in "$@"; do [ "$a" = "--no-proxy" ] && NOPROXY=1; done
 
@@ -66,14 +69,15 @@ if [ -n "$CHROME" ]; then
   "$CHROME" --headless=new --disable-gpu --user-data-dir="$CDIR" ${PX:+--proxy-server="$PX"} \
     --virtual-time-budget=20000 --timeout=40000 --dump-dom "https://ipinfo.io/$IP" 2>/dev/null > "$DOMF"
   rm -rf "$CDIR"
-  python3 << PYEOF
-import re
+  DOMF="$DOMF" IP="$IP" python3 <<'PYEOF'
+import os, re
+IP=os.environ['IP']
 try:
-    h=open('$DOMF',encoding='utf-8',errors='ignore').read()
+    h=open(os.environ['DOMF'],encoding='utf-8',errors='ignore').read()
 except Exception:
-    print("  (页面抓取失败, 请浏览器复核 https://ipinfo.io/$IP)"); raise SystemExit
+    print(f"  (页面抓取失败, 请浏览器复核 https://ipinfo.io/{IP})"); raise SystemExit
 if 'Anonymization' not in h:
-    print("  (页面未完整渲染, 请浏览器复核 https://ipinfo.io/$IP)"); raise SystemExit
+    print(f"  (页面未完整渲染, 请浏览器复核 https://ipinfo.io/{IP})"); raise SystemExit
 
 t=re.sub(r'<(svg|script|style)[^>]*>.*?</\1>','',h,flags=re.S)
 t=re.sub(r'<[^>]+>','\n',t).replace('&amp;','&')
@@ -120,7 +124,7 @@ for i,l in enumerate(lines):
         v6=l.split(':',1)[1].strip() if ':' in l else lines[i+1]
         break
 if v6: print(f'IPv6            : {v6}')
-print(f'页面复核        : https://ipinfo.io/$IP')
+print(f'页面复核        : https://ipinfo.io/{IP}')
 PYEOF
   rm -f "$DOMF"
 else
@@ -195,12 +199,13 @@ COF="https://ip.net.coffee/api/ipv2"
 LK=$(curl -s --noproxy '*' -m 15 ${CPXOPT:-} "$COF/lookup/$IP")
 RAD=$(curl -s --noproxy '*' -m 15 ${CPXOPT:-} "$COF/radar/$(echo "$LK" | python3 -c "import json,sys;print(json.load(sys.stdin).get('asn',0))" 2>/dev/null)" 2>/dev/null)
 DNSBL=$(curl -s --noproxy '*' -m 20 ${CPXOPT:-} "$COF/dnsbl/$IP" 2>/dev/null)
-python3 << PYEOF
-import json
+LK="$LK" DNSBL="$DNSBL" RAD="$RAD" IP="$IP" python3 <<'PYEOF'
+import json, os
+IP=os.environ['IP']
 try:
-    d=json.loads('''$LK''')
+    d=json.loads(os.environ.get('LK',''))
 except Exception:
-    print("  (lookup 接口失败, 请浏览器复核 https://ip.net.coffee/ip/$IP)"); raise SystemExit
+    print(f"  (lookup 接口失败, 请浏览器复核 https://ip.net.coffee/ip/{IP})"); raise SystemExit
 def g(k,alt='?'): return d.get(k) if d.get(k) not in (None,'',[]) else alt
 
 reg=d.get('registered_country') or d.get('country')
@@ -224,7 +229,7 @@ rpki=rpki_map.get(g('rpki_status'), g('rpki_status'))
 print(f"技术指标       : Bogon={'是(异常)' if d.get('is_bogon') else '否(公网可达)'} · rDNS={rdns} · RPKI={rpki}")
 print(f"滥用等级       : {g('abuser_score')}")
 try:
-    db=json.loads('''$DNSBL''')
+    db=json.loads(os.environ.get('DNSBL',''))
     rs=db.get('results',[])
     listed=[r['engine'] for r in rs if r.get('listed')]
     print(f"DNSBL 黑名单   : {len(rs)-len(listed)}/{len(rs)} 家纯净" + (f" ⚠️ 被列: {listed}" if listed else ""))
@@ -238,10 +243,10 @@ if isinstance(ai,dict):
 print(f"信任评分       : {g('trust_score')}/100")
 
 try:
-    r=json.loads('''$RAD''')
+    r=json.loads(os.environ.get('RAD',''))
     print(f"人机流量       : 人类 {r.get('human')}% · 机器 {r.get('bot')}% (28天)")
 except: pass
-print(f"页面复核       : https://ip.net.coffee/ip/$IP")
+print(f"页面复核       : https://ip.net.coffee/ip/{IP}")
 PYEOF
 
 echo ""
