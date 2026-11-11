@@ -3,7 +3,7 @@ name: vps-node
 description: Pre-flight a freshly bought VPS (hardware / IP reputation / return route, nothing installed) and only then provision a production-ready proxy node — sing-box (VLESS+REALITY :443 + Hysteria2 :8443), BBR tuning, DuckDNS + Let's Encrypt HTTPS subscription endpoint, security hardening (ufw/SSH/sysctl/fail2ban), and a 9-source external IP reputation audit. Use when the user buys a new VPS, wants to set up a 节点/机场/梯子, replace a residential proxy node, or asks to harden + audit a VPS.
 description_zh: "新 VPS 上线全流程：先验货（硬件/IP 质量/回程，不装机）→ sing-box 双协议节点 + BBR + 免费域名 HTTPS 订阅 + 安全加固 + IP 风险体检 → 验收 → 服务端哨兵"
 description_en: "One-shot VPS node deployment: sing-box dual protocol, BBR, HTTPS subscription via DuckDNS+LE, hardening, IP reputation audit"
-version: 1.14.2
+version: 1.14.3
 allowed-tools: Read,Write,Edit,Bash
 display_name: "VPS 节点上线"
 visibility: "public"
@@ -468,7 +468,7 @@ bash scripts/ip-check-lite.sh --note-db 'ipqs=75,ipqs.proxy=1,ipqs.vpn=1,ip2loca
 bash scripts/ip-check-lite.sh --clear-notes <IP>
 ```
 
-解锁结果只写入优点/风险，**不改变** 留/换结论。`--note-db` 与 `--note-unlock` 会写入 `~/.vps-node/ipaudits/<IP>/notes.json`（权限 600），后续对同一 IP 的运行会合并最新手动项，除非加 `--clear-notes`。二/三/四/六段对应格子带「（手动）」标记；IPQS 代理/VPN 按高权重标志计，IPQS 分数 ≥75 为可疑、≥85 为严重，真实 DNSBL 黑名单 >0 计入风险；若手动黑名单有效库过少（例如仅 1 家），视为覆盖不全，不当作信号。 手动库的类型票按 0.5 计入（同源数据，净贡献最多 +2，且不超过实时源），避免截图里的多家库把机房多数翻成家宽多数。IPQS ≥75 且同时标记 proxy/VPN，或 IP2Location 风险 ≥75 且同时标记 proxy/VPN（同为高权重旗），或真实 DNSBL 命中且另有高权重代理/VPN 标志，或至少两个独立库标记代理/VPN，直接建议换。ipinfo 请求使用 `/json` + `Accept: application/json` + 完整浏览器 UA，避免误报 406。Claude 遇到 Cloudflare 挑战记「未知」而不当屏蔽；Gemini 不以 `UnavailableSurface-*.js` 文件名为屏蔽依据。未知的解锁结果不改 AI 适用分。`--local` 在 macOS 或本机接口没有公网 IPv4 时，本地 25 端口显示「仅 VPS 上可测」。ChatGPT / Reddit / Claude / Gemini 等被屏蔽会列为风险。
+解锁结果只写入优点/风险，**不改变** 留/换结论。`--note-db` 与 `--note-unlock` 会写入 `~/.vps-node/ipaudits/<IP>/notes.json`（权限 600），后续对同一 IP 的运行会合并最新手动项，除非加 `--clear-notes`。二/三/四/六段对应格子带「（手动）」标记；IPQS 代理/VPN 按高权重标志计，IPQS 分数 ≥75 为可疑、≥85 为严重，真实 DNSBL 黑名单 >0 计入风险；若手动黑名单有效库过少（例如仅 1 家），视为覆盖不全，不当作信号。 手动库的类型票按 0.5 计入（同源数据，净贡献最多 +2，且不超过实时源），避免截图里的多家库把机房多数翻成家宽多数。IPQS ≥75 且同时标记 proxy/VPN，或 IP2Location 风险 ≥75 且同时标记 proxy/VPN（同为高权重旗），或真实 DNSBL 命中且另有高权重代理/VPN 标志，或至少两个独立库标记代理/VPN，直接建议换。ipinfo 请求使用 `/json` + `Accept: application/json` + 工具 UA（`ip-check-lite/<版本>`）；不要用 Chrome 等浏览器 UA，ipinfo.io 会固定回 406。其他源仍用浏览器 UA。Claude 遇到 Cloudflare 挑战记「未知」而不当屏蔽；Gemini 不以 `UnavailableSurface-*.js` 文件名为屏蔽依据。未知的解锁结果不改 AI 适用分。`--local` 在 macOS 或本机接口没有公网 IPv4 时，本地 25 端口显示「仅 VPS 上可测」。ChatGPT / Reddit / Claude / Gemini 等被屏蔽会列为风险。
 
 另有「AI 适用分」（0–100），与综合分（家宽真实性）分开算：代理/VPN/Tor 和真实黑名单/AbuseIPDB 权重大（Scamalytics、IPQS 类来源比 IPLogs 这类标签扣得更重），Scamalytics Fraud Score 中等，机房票较轻（3:2 只小扣，机房多数仍重扣），登记不一致/无 PTR 很轻，主流运营商小加分。若已测或手动记录了 ChatGPT/Claude/Gemini，解锁结果权重最大：ChatGPT 解锁大幅加分，屏蔽大幅减分。情况分析里会印「AI 用途: xx / 100  建议：可用/观察/不建议」及原因。Claude（claude.ai 区域页）和 Gemini（gemini.google.com）在 `--proxy` / `--local` 时做轻量探测。
 本机 stdout 是终端时会着色，可用 `NO_COLOR=1` 关掉。

@@ -59,7 +59,10 @@
 # ============================================================================
 set -uo pipefail
 
+VERSION="1.14.3"
 UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+# ipinfo.io 对 Chrome 等浏览器 UA 固定回 406；改用工具 UA + Accept: application/json
+IPINFO_UA="ip-check-lite/${VERSION}"
 KEYFILE="${HOME}/.vps-node/abuseipdb.key"
 ABUSEIPDB_KEY="${ABUSEIPDB_KEY:-}"
 
@@ -378,16 +381,18 @@ fetch_one() {
   : > "$errf"
   printf '000' > "$codef"
   local http
-  # ipinfo 免费层对不完整 UA / 缺少 Accept: application/json 会回 406；路径必须是 /json
-  local accept=()
+  # ipinfo：路径必须是 /json；用工具 UA（浏览器 UA 会 406）+ Accept: application/json
+  local ipinfo_hdrs=()
+  local fetch_ua="$UA"
   if [ "$name" = "ipinfo" ]; then
     case "$url" in
       */json|*/json[?]*) ;;
       *) url="${url%/}/json" ;;
     esac
-    accept=(-H "Accept: application/json")
+    fetch_ua="$IPINFO_UA"
+    ipinfo_hdrs=(-H "Accept: application/json")
   fi
-  http=$(curl -sS -o "$body" -w '%{http_code}' --max-time "$t" -L -A "$UA" "${accept[@]}" "$url" 2>"$errf") || true
+  http=$(curl -sS -o "$body" -w '%{http_code}' --max-time "$t" -L -A "$fetch_ua" "${ipinfo_hdrs[@]}" "$url" 2>"$errf") || true
   [ -n "$http" ] || http=000
   printf '%s' "$http" > "$codef"
 }
@@ -438,7 +443,14 @@ fetch_keyed() {
     printf 'show-error\n'
     printf 'location\n'
     printf 'max-time = %s\n' "$t"
-    printf 'user-agent = "%s"\n' "$UA"
+    case "$name" in
+      ipinfo|ipinfo_full)
+        printf 'user-agent = "%s"\n' "$IPINFO_UA"
+        ;;
+      *)
+        printf 'user-agent = "%s"\n' "$UA"
+        ;;
+    esac
     printf 'output = "%s"\n' "$body"
     printf 'write-out = "%%{http_code}"\n'
     printf 'url = "%s"\n' "$url"
