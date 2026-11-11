@@ -35,6 +35,9 @@
 | 哨兵：即时体检 | `vps-sentinel.sh` |
 | 哨兵：服务端 cron 采集 + 本机拉取分析 | `vps-sentinel-agent.sh` `vps-sentinel-fetch.sh` `vps-sentinel-install.sh` |
 | 生成日检 / 周检 automation 规格 | `vps-automation-spec.sh` |
+| 裸 IP 快查（购买前，免注册三源：ipinfo / IPLogs / Scamalytics） | `ip-check-lite.sh` |
+| IP 完整体检（经代理 / VPS 跑 IP.Check.Place 六节，含解锁与黑名单） | `ip-audit.sh` |
+| 仓库自检：脚本语法 + 敏感值 / token 扫描（CI 同款） | `repo-lint.sh` |
 
 ## 安装
 

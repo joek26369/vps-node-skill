@@ -3,10 +3,10 @@ name: vps-node
 description: Pre-flight a freshly bought VPS (hardware / IP reputation / return route, nothing installed) and only then provision a production-ready proxy node — sing-box (VLESS+REALITY :443 + Hysteria2 :8443), BBR tuning, DuckDNS + Let's Encrypt HTTPS subscription endpoint, security hardening (ufw/SSH/sysctl/fail2ban), and a 9-source external IP reputation audit. Use when the user buys a new VPS, wants to set up a 节点/机场/梯子, replace a residential proxy node, or asks to harden + audit a VPS.
 description_zh: "新 VPS 上线全流程：先验货（硬件/IP 质量/回程，不装机）→ sing-box 双协议节点 + BBR + 免费域名 HTTPS 订阅 + 安全加固 + IP 风险体检 → 验收 → 服务端哨兵"
 description_en: "One-shot VPS node deployment: sing-box dual protocol, BBR, HTTPS subscription via DuckDNS+LE, hardening, IP reputation audit"
-version: 1.10.0
+version: 1.10.1
 allowed-tools: Read,Write,Edit,Bash
 display_name: "VPS 节点上线"
-visibility: "private"
+visibility: "public"
 ---
 
 # VPS 节点上线
@@ -137,8 +137,8 @@ SKIP_IPAUDIT=1 bash bootstrap-new-vps.sh ...
 |---|---|---|
 | 1 | **验货**（`vps-precheck.sh --ipaudit`）：机器 / IP 质量 9 项 / 回程 / AI 站连通，判 FAIL 则中止 | 是（`FORCE=1` 可强推） |
 | 2 | 上传并执行 `vps-node-init.sh`（8 子步，2-4 分钟） | 是 |
-| 3 | 解析 `VPS_RESULT_JSON`，凭据落 `~/.vps-node/<sub>.json`（600） | 是 |
-| 4 | 装 ed25519 公钥、关密码登录，**验证密钥可登录后才继续** | 是 |
+| 3 | 解析 `VPS_RESULT_JSON`，凭据落 `~/.vps-node/<sub>.json`（600，含 `ssh_port`）；部署日志脱敏后存档 | 是 |
+| 4 | 装 ed25519 公钥 → **验证密钥可登录** → 才写 `sshd_config.d/00-vps-node-auth.conf` 关密码登录（压过 cloud-init 的 50-*.conf） | 是 |
 | 5 | 上传并执行 `vps-harden.sh`（ufw/SSH/sysctl/fail2ban/补丁） | 部分容忍 |
 | 6 | `clash://` 深链导入 Verge 新档案 | 否 |
 
@@ -262,7 +262,7 @@ NODE_NAME=MyNode bash scripts/vps-automation-spec.sh <凭据别名>   # 换显�
 bash scripts/vps-sentinel-fetch.sh <凭据别名>            # 服务端摘要 + 本机探测 + 异常聚合
 bash scripts/vps-sentinel-fetch.sh <凭据别名> --json     # 机读
 bash scripts/vps-sentinel-fetch.sh <凭据别名> --full     # 展开每条异常原始记录
-bash scripts/vps-sentinel-fetch.sh <凭据别名> --days 3   # 只看最近 3 天
+bash scripts/vps-sentinel-fetch.sh <凭据别名> --days 3   # 看最近 3 天（默认 1 天，--days 0 看全部 30 天）
 bash scripts/vps-sentinel-fetch.sh <凭据别名> --no-local # 跳过本机探测（Mac 在其他网络时用）
 ```
 
@@ -393,7 +393,7 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 - **带宽额度按套餐共享**：两条 IP 烧同一份额度，不是各自一份
 - 挑 IP 时注意 Proxy List 里**每条的端口可能不同**（同一账号下不同 IP 的端口常不一样），IP 也可能只差一位，配置前必须照抄列表行
 
-**回滚**：还原 `/etc/sing-box/config.json.bak-before-webshare` 并重启；或删掉 `webshare-us` 出站、`route.final` 改回 `direct`、删掉 UDP 规则。凭据里的 `egress_ip` 字段同步删掉。
+**回滚**：同上；双出口时把 `webshare-us2` 和 `webshare-auto` / `webshare` 两个组一并删掉，`egress_ip` 改回单值或删除。
 
 ## IP 体检（购买前 / 购买后）
 
@@ -426,7 +426,7 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 - **`--expect` 不要省**：同一商家多条 IP 时极易搞混（实测出现过两条 IP 只差最后一位、端口还不同的情况），出口 echo 不等于期望值就中止，避免把 A 的报告当成 B 的
 - **报告公开且不可撤回**：`Report.Check.Place` 只露掩码 IP / ASN / 评分，不含完整 IP，但没有删除接口。本地留档在 `~/.vps-node/ipaudits/<出口IP>/`
 
-
+## 故障排查
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
@@ -437,8 +437,10 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 | 预检判 FAIL 但你想硬上 | 已知风险可接受 | `FORCE=1 bash bootstrap-new-vps.sh ...` |
 | `duckdns update failed` | token 错 / 子域名未在网页添加 | 去 duckdns.org 确认 Domains 列表 |
 | acme.sh 签发失败 | DNS 未传播 / LE 限流 | 脚本已自动 `--force` 重试一次；仍失败等 5 分钟重跑 `--issue` |
-| 第 4 步密钥登录失败 | authorized_keys 权限 / sshd 配置 | 脚本会中止且不加固，重新跑即可 |
-| 加固后 SSH 断开 | ufw 未放行 SSH | 用 VPS 控制台 VNC 进 `ufw disable`；脚本本有防锁死校验，出现即查 `SSH_PORT` 参数是否与实际一致 |
+| 第 4 步密钥登录失败 | authorized_keys 权限 / sshd 配置 | 脚本会中止，此时密码登录尚未关闭，修好后重新跑即可 |
+| 关密码登录后仍能用密码登 | 其它 `sshd_config.d/*.conf` 排在 `00-vps-node-auth.conf` 之前 | `sshd -T \| grep passwordauthentication` 看生效值，检查更靠前的 conf |
+| 加固拒绝启用 ufw | `SSH_PORT` 与 `sshd -T` 的实际端口不一致 | 用实际端口重跑：`SSH_PORT=<sshd -T 里的 port>`；防锁死设计，不是 bug |
+| 加固后 SSH 断开 | ufw 未放行 SSH | 用 VPS 控制台 VNC 进 `ufw disable`；旧规则备份在 `/root/ufw-backup-*/` |
 | 订阅 404 | 端口没放行 / 服务名不符 / token 不匹配 | `systemctl status vps-sub-https`、`ufw status`、`ls /opt/vps-sub` |
 | REALITY 证书是自签 | dest 不支持 TLS1.3 或 H2 | 换 dest 站点，改 init 脚本 `DEST` 后重跑配置段 |
 | Verge 没出现新卡片 | 深链未生效 | Verge → 配置 → 新建 → 从 URL 导入 `<SUBURL>` |
@@ -453,7 +455,7 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 | 8443 | udp | Hysteria2 |
 | 2096 | tcp | HTTPS 订阅（仅 `/<token>.yaml` 可达，TLS1.2+） |
 
-VPS 侧：`/etc/sing-box/config.json`、`/opt/vps-sub/<token>.yaml`、`/opt/vps-certs/`、`/opt/serve_sub_https.py`、`/etc/systemd/system/vps-sub-https.service`、`/etc/ssh/sshd_config.d/99-hardening.conf`、`/etc/sysctl.d/99-hardening.conf`、`/etc/fail2ban/jail.local`
+VPS 侧：`/etc/sing-box/config.json`、`/opt/vps-sub/<token>.yaml`、`/opt/vps-certs/`、`/opt/serve_sub_https.py`、`/etc/systemd/system/vps-sub-https.service`、`/etc/ssh/sshd_config.d/00-vps-node-auth.conf`（仅密钥登录）、`/etc/ssh/sshd_config.d/99-hardening.conf`、`/etc/systemd/system/sing-box.service`（tar.gz 安装时补写）、`/etc/sysctl.d/99-hardening.conf`、`/etc/fail2ban/jail.local`
 
 服务端哨兵（装了才有）：`/usr/local/bin/vps-sentinel-agent.sh`、`/etc/vps-sentinel.conf`（600）、`/etc/cron.d/vps-sentinel`、`/var/log/vps-sentinel/sentinel.jsonl`（600，30 天 / 8000 行自滚动）
 
@@ -468,7 +470,9 @@ VPS 侧：`/etc/sing-box/config.json`、`/opt/vps-sub/<token>.yaml`、`/opt/vps-
 bash scripts/vps-precheck.sh <IP> <SSH_PORT> '<ROOT_PASS>'
 
 # 只做安全加固（对已有 VPS）
-scp scripts/vps-harden.sh root@IP:/root/ && ssh root@IP 'SSH_PORT=22 bash /root/vps-harden.sh'
+# SSH_PORT 必须填 sshd 实际端口（脚本会用 sshd -T 核对，不一致就拒绝动防火墙）。
+# 默认在现有 ufw 规则上追加并先备份到 /root/ufw-backup-*；要清空重建才加 --reset-ufw
+scp -P <SSH_PORT> scripts/vps-harden.sh root@<IP>:/root/ && ssh -p <SSH_PORT> root@<IP> 'SSH_PORT=<SSH_PORT> bash /root/vps-harden.sh'
 
 # 只做 IP 体检
 bash scripts/vps-external-ip-check.sh <IP> 443
@@ -476,7 +480,7 @@ bash scripts/vps-external-ip-check.sh <IP> 443
 # ---- IP 体检三阶段（详见「IP 体检」一节）----
 # 购买前：只有裸 IP，免注册三源快查
 bash scripts/ip-check-lite.sh <IP>
-# 购买后·情况一：有代理凭据，经 VPS 转发跑全六节（凭据自动转义）
+# 购买后·情况一：有代理凭据，经 VPS 转发跑全六节（凭据走 stdin，不进命令行；--expect 必填）
 bash scripts/ip-audit.sh --proxy 'socks5h://user:pass@host:port' --expect <IP> --node <凭据别名>
 # 购买后·情况二：纯 VPS，直接上去跑
 bash scripts/ip-audit.sh --vps-ip <IP> --vps-port 22
@@ -518,7 +522,7 @@ bash scripts/repo-lint.sh
 - 证书 90 天有效期由 acme.sh cron 自动续期，无需干预
 - 加固刻意**未做**：建 sudo 用户并禁 root、auditd、lynis。如需更严合规可另加
 - **NodeQuality 结果一律公开、且不可撤回**：`/result/*` 打 zip 后 base64 POST 到 `api.nodequality.com`，返回 `nodequality.com/r/<随机串>`；xykt 三份分报告另存在 `Report.Check.Place`。2026-11 实测暴露面：
-  - 公开可读（无需任何验证，直接 curl 就 200）：掩码 IP（`a.b.*.*`，只藏后两段）、ASN 与组织、城市、CPU/内存/磁盘规格、解锁清单、三网回程路径、上游对等 AS 列表
+  - 公开可读（无需任何验证，直接 curl 就 200）：掩码 IP（形如 `a.b.*.*`，只藏后两段）、ASN 与组织、城市、CPU/内存/磁盘规格、解锁清单、三网回程路径、上游对等 AS 列表
   - 需过 Cloudflare Turnstile 才能看：nodequality 汇总页（无 token 一律 403）；其 zip 含 xykt 原始输出与回程 JSON，**未做脱敏**，这是唯一说不准的部分
   - 完全不出现：完整 IP、主机名、DuckDNS 域名、SSH 端口、UUID / REALITY 密钥 / Hy2 密码（这些脚本不读 sing-box 配置）
   - 前端只有 `record` / `searchRecord` / `setprovider`，**没有删除接口** —— 链接一旦产生就撤不回来
