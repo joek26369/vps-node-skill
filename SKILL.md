@@ -477,6 +477,8 @@ bash scripts/ip-check-lite.sh --clear-notes <IP>
 
 测了多条 IP 之后，用 `ip-compare.sh` 做整体比较。默认按综合分（家宽真实性）排名；看 ChatGPT/Claude 出口用 `--for ai` 按 AI 适用分排名（并列时优先更少的代理/VPN 标记、ChatGPT 已解锁、更低的 Scamalytics）。Markdown 报告始终同时给出两套排名。
 
+示例输出见 [references/ip-compare-example.md](references/ip-compare-example.md)（已脱敏）。
+
 
 ```bash
 # 分 5 次各测一条（每次都会给出该 IP 的留 / 换 / 待复核）
