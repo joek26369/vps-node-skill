@@ -17,8 +17,9 @@
 #     bash ip-audit.sh --node <别名> --egress us1|us2
 #
 # 选项:
-#   --proxy <URI>   代理地址（socks5h:// 或 http://，凭据含特殊字符会自动转义）
-#   --expect <IP>   出口 echo 校验，不匹配即中止（防测错对象）
+#   --proxy <URI>   代理地址（socks5h:// 或 http://；用户名/密码里的特殊字符需自行 URL 编码）
+#                   凭据经 stdin / 环境变量传给执行端，不出现在本机或 VPS 的进程参数里
+#   --expect <IP>   出口 echo 校验，不匹配即中止（防测错对象；--proxy 模式必填）
 #   --vps-ip/-port  情况二: 目标 VPS 的 SSH 地址（私钥走 skill 统一探测链）
 #   --node <别名>   读 ~/.vps-node/<别名>.json 定位 VPS；凭据从 VPS 上
 #                   /etc/sing-box/config.json 的出站取，不落本地明文
@@ -26,7 +27,7 @@
 #   --local         在本机跑（不推荐: 本机 Clash TUN fake-ip 会让 DNSBL 一节失真）
 #
 # 产出: ~/.vps-node/ipaudits/<出口IP>/<时间戳>.log（含公开报告链接）
-# 退出码: 0 完成 / 3 出口校验失败 / 2 参数错误
+# 退出码: 0 完成 / 3 出口校验失败 / 2 参数错误 / 4 执行失败（SSH 不通或无出口）
 #
 # 注意: SSH 类操作请在前台运行；后台任务会被沙箱拦截 ~/.ssh 读取。
 # ============================================================================
@@ -56,6 +57,9 @@ if [ "$MODE_N" -ne 1 ]; then
   echo "  ip-audit.sh --vps-ip <IP> --vps-port <SSH端口> [--expect <IP>]    # 情况二: 纯 VPS 直跑" >&2
   echo "  ip-audit.sh --node <别名> --egress us1|us2                        # 便捷: 已配进出站" >&2
   exit 2
+fi
+if [ -n "$PROXY_URI" ] && [ -z "$EXPECT" ]; then
+  echo "--proxy 模式必须带 --expect <期望出口IP>（防把 A 的报告当成 B 的）"; exit 2
 fi
 if [ -n "$EGRESS" ] && [ -z "$NODE" ]; then
   echo "--egress 需要 --node <别名>（凭据从该 VPS 的 config.json 取）"; exit 2
@@ -106,13 +110,15 @@ fi
 
 STAMP=$(date +%Y%m%d-%H%M)
 TMPLOG=$(mktemp /tmp/ipaudit.XXXXXX)
-trap 'rm -f "$TMPLOG"' EXIT
+REMOTE_SH=$(mktemp /tmp/ipaudit-remote.XXXXXX)
+trap 'rm -f "$TMPLOG" "$REMOTE_SH"' EXIT
 
 # ---- 远端脚本（凭据只在 VPS 侧解析，不落本地明文）----
-cat > "$TMPLOG.remote" <<'REMOTE'
+cat > "$REMOTE_SH" <<'REMOTE'
 #!/bin/bash
 set -u
-PROXY_URI="$1"; EXPECT="$2"; TAG="$3"
+# 参数由调用方经环境变量（本机）或 stdin 头部赋值（远端）给出，不走命令行
+PROXY_URI="${PROXY_URI-}"; EXPECT="${EXPECT-}"; TAG="${TAG-}"
 # curl 的协议专属变量(http_proxy/https_proxy)优先级高于 ALL_PROXY，
 # 环境里若已存在会被劫持，所以两者一起覆盖。
 set_proxy() {
@@ -145,23 +151,32 @@ if [ -n "$EXPECT" ] && [ "$EIP" != "$EXPECT" ]; then
   echo "FATAL: 出口 ${EIP:-FAIL} != 期望 ${EXPECT}，中止体检"; exit 9
 fi
 echo "== 开始体检 $(date -u '+%FT%TZ') =="
-curl -sL https://IP.Check.Place | bash -s 2>&1
+# 先下载再执行（不直接 curl | bash），下载失败就报错而不是执行半截脚本
+ICP=$(mktemp /tmp/ipcheck.XXXXXX)
+if curl -fsSL --max-time 60 https://IP.Check.Place -o "$ICP" && [ -s "$ICP" ]; then
+  bash "$ICP" 2>&1
+else
+  echo "FATAL: 下载 IP.Check.Place 脚本失败"
+fi
+rm -f "$ICP"
 echo "== 体检结束 $(date -u '+%FT%TZ') =="
 REMOTE
 
 # ---- 执行 ----
 if [ "$RUN_LOCAL" -eq 1 ]; then
-  bash "$TMPLOG.remote" "$PROXY_URI" "$EXPECT" "$CTAG" 2>&1 | tee "$TMPLOG"
+  PROXY_URI="$PROXY_URI" EXPECT="$EXPECT" TAG="$CTAG" bash "$REMOTE_SH" 2>&1 | tee "$TMPLOG"
   RC=${PIPESTATUS[0]}
 else
   echo "跑在 ${NODE:-${SSH_HOST}}（${SSH_HOST}:${SSH_PORT}），私钥 $KEY"
-  ssh -i "$KEY" -p "$SSH_PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
-      -o ConnectTimeout=15 "root@${SSH_HOST}" \
-      "bash -s -- '${PROXY_URI}' '${EXPECT}' '${CTAG}'" < "$TMPLOG.remote" 2>&1 | tee "$TMPLOG"
-  RC=${PIPESTATUS[0]}
+  # 凭据以 %q 转义后写在 stdin 脚本头部，远端 ps 只能看到 "bash -s"
+  { printf 'PROXY_URI=%q\nEXPECT=%q\nTAG=%q\n' "$PROXY_URI" "$EXPECT" "$CTAG"; cat "$REMOTE_SH"; } \
+    | ssh -i "$KEY" -p "$SSH_PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+        -o ConnectTimeout=15 "root@${SSH_HOST}" 'bash -s' 2>&1 | tee "$TMPLOG"
+  RC=${PIPESTATUS[1]}
 fi
 
 [ "$RC" -eq 9 ] && { echo "出口校验失败，未产出报告"; exit 3; }
+[ "$RC" -eq 255 ] && { echo "SSH 失败（${SSH_HOST}:${SSH_PORT}），未产出报告"; exit 4; }
 
 # ---- 归档: 用实测出口 IP 命名目录 ----
 EIP=$(grep -m1 '^echo_ip=' "$TMPLOG" | cut -d= -f2)
@@ -170,13 +185,16 @@ if [ -n "$EIP" ] && [ "$EIP" != "FAIL" ]; then
   mkdir -p "$SAVEDIR"
   FINAL="$SAVEDIR/audit-${STAMP}.log"
   mv "$TMPLOG" "$FINAL"
-  trap - EXIT
+  rm -f "$REMOTE_SH"; trap - EXIT
   echo "----------------------------------------"
   echo "日志: $FINAL"
+  chmod 600 "$FINAL"
   grep -m1 -oE 'https://Report\.Check\.Place/ip/[A-Za-z0-9]+\.svg' "$FINAL" | sed 's/^/公开报告: /' || true
   # 摘要: 六节关键行（去 ANSI）
   echo "===== 摘要 ====="
   perl -pe 's/\e\[[0-9;]*[A-Za-z]//g; s/\e\][^\e]*(\e\\|\x07)//g; s/[\x00-\x08\x0b\x0c\x0e-\x1f]//g' "$FINAL" \
     | grep -E '^(自治系统号|组织|时区|IP类型|IPQS|Scamalytics|AbuseIPDB|ipapi|IP2Location|黑名单|echo_ip=)' | head -20
+else
+  echo "未拿到出口 IP（echo_ip=FAIL），未归档"; exit 4
 fi
 exit 0
