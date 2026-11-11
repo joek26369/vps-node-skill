@@ -428,10 +428,10 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 
 | 指标 | 通过 | 复核 | 放弃 |
 |---|---|---|---|
-| 类型投票（coffee / ipx.al / iping / IPLogs / Scamalytics Server） | ≥ 2 个独立源判 ISP/家宽，且机房票不成多数 | 家宽票不足 2，或与机房票打平 | 机房/IDC 票占多数 |
+| 类型投票（coffee / ipx.al / iping / IPLogs / Scamalytics Server） | ≥ 2 个独立源判 ISP/家宽，且机房票不成多数 | 家宽票不足 2，或与机房票打平；或机房票 ≥ 2（即使家宽仍占多数，含仅多 1 票，仍复核不放弃） | 机房/IDC 票占多数 |
 | 主流家宽运营商加分（仅 AT&T / Verizon / Comcast） | 加分不是否决。机房票为 0 时计为 +1 家宽票，并让 Scamalytics 11–25 仅作参考 | — | 不覆盖机房多数、代理/VPN/Tor、DNSBL、AbuseIPDB、广播、Fraud Score >25。商业线（Comcast Business、无消费侧证据的 Verizon Business/UUNET 等）不加分；AS701 需 fios 等消费侧证据。移动网加分但标注「移动网络」 |
 | 代理 / VPN / Tor | 全部无 | 单源阳性 | ≥ 2 个源阳性 |
-| Scamalytics Fraud Score | —（≤10 低风险参考） | 11–25 **仅作参考**：类型投票明确为家宽且标志干净时，不单独触发复核 | > 25 |
+| Scamalytics Fraud Score | —（≤10 低风险参考） | 11–25 **仅作参考**：类型投票明确为家宽、机房票 < 2 且标志干净时，不单独触发复核。Server=Yes 计为机房票并列入风险 | > 25 |
 | IPLogs verdict | `clean` | 其它值 | — |
 | DNSBL（coffee 服务端） | 未列，或仅 Spamhaus PBL（`127.0.0.10` / `127.0.0.11`，标「PBL（家宽正常）」） | SBL / XBL / CSS 或其他名单命中 | — |
 | 原生 / 广播（ipx.al `native.verdict`、iping `type`） | native | broadcast / 注册地与使用地不一致 | — |
@@ -440,7 +440,7 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 
 `ip-check-lite.sh` 退出码：0 = 通过（**留**）；1 = 需人工复核（**待复核**）；3 = 放弃（**换**）；2 = 参数错误。任一启用源超时、被拦、解析失败，都至少判复核（fail-closed）。过了快查再花钱/花时间跑全量。
 
-每次快查结束会打印「情况分析」：结论（留 / 换 / 待复核）、0–100 综合分（类型投票、主流运营商加分、代理标志、Scamalytics、原生/广播、DNSBL、rDNS、源完整性；AbuseIPDB 有结果时再加减），以及优点、风险和一句建议。待复核会写明是因为检测源失败，还是 IP 本身有需要确认的信号。机器可读摘要写在 `~/.vps-node/ipaudits/<IP>/lite-<stamp>.json`（权限 600），不含密钥。
+每次快查结束会打印「情况分析」：结论（留 / 换 / 待复核）、0–100 综合分（类型投票、主流运营商加分、代理标志、Scamalytics、原生/广播、DNSBL、rDNS、源完整性；AbuseIPDB 有结果时再加减），以及优点、风险和一句建议。待复核会写明原因：仅当完全没有实际信号时才写「仅检测源失败」；否则先列出实际信号（例如有 N 个源判机房、代理/VPN 标记），检测源失败只作为补充。机器可读摘要写在 `~/.vps-node/ipaudits/<IP>/lite-<stamp>.json`（权限 600），不含密钥。
 
 测了多条 IP 之后，用 `ip-compare.sh` 做整体比较，看哪条更值得留：
 

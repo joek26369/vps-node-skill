@@ -487,9 +487,24 @@ sug = top.get("suggestion") or ""
 if sug:
     para.append("它的单条建议是「%s」。" % sug)
 
-if top.get("verdict") == "review" and top.get("review_reason") == "source_failure":
+def only_source_failure(r):
+    # 旧 JSON 可能把「机房票 ≥ 2 / 代理标记」误标成 source_failure，比较时再挡一层
+    if r.get("review_reason") != "source_failure":
+        return False
+    tv = r.get("type_votes") or {}
+    try:
+        host = int(tv.get("hosting") or 0)
+    except (TypeError, ValueError):
+        host = 0
+    if host >= 2:
+        return False
+    if r.get("flags"):
+        return False
+    return True
+
+if top.get("verdict") == "review" and only_source_failure(top):
     failed = "、".join(top.get("failed_sources") or []) or "检测源"
-    para.append("但第一名仍是「待复核」，原因是检测源失败（%s），不是这份 IP 本身更差。源恢复后建议 --rerun，再据此做决定。" % failed)
+    para.append("但第一名仍是「待复核」，原因是仅检测源失败（%s），不是这份 IP 本身更差。源恢复后建议 --rerun，再据此做决定。" % failed)
 elif top.get("verdict") == "review":
     para.append("第一名仍是「待复核」，先看清风险再决定是否留下。")
 elif top.get("verdict") == "reject":
@@ -498,8 +513,8 @@ elif top.get("verdict") == "reject":
 if rejects:
     para.append("建议换掉: " + "、".join("%s（%s）" % (display_ip(r["_ip"]), r.get("suggestion") or "放弃") for r in rejects) + "。")
 if reviews:
-    only_fail = [r for r in reviews if r.get("review_reason") == "source_failure"]
-    real = [r for r in reviews if r.get("review_reason") != "source_failure"]
+    only_fail = [r for r in reviews if only_source_failure(r)]
+    real = [r for r in reviews if not only_source_failure(r)]
     if only_fail and only_fail != reviews:
         para.append("因源失败而待复核（类型与标志本身不差）: " + "、".join(display_ip(r["_ip"]) for r in only_fail) + "。")
     if real:

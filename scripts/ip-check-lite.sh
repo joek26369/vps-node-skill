@@ -18,10 +18,11 @@
 #
 # 判定摘要:
 #   类型投票：至少 2 个独立源判 ISP/家宽，且机房票不成多数，才可通过；
-#             机房票占多数则放弃。
+#             机房票占多数则放弃。机房票 ≥ 2（即使家宽仍占多数，含仅多 1 票）
+#             至少复核，不直接放弃。
 #   代理/VPN/Tor：单源阳性 → 复核；两源及以上阳性 → 放弃。
-#   Scamalytics 分数：>25 放弃；11–25 仅作参考（类型投票明确为家宽且标志干净时
-#             单独不足以触发复核）。
+#   Scamalytics 分数：>25 放弃；11–25 仅作参考（类型投票明确为家宽、机房票 < 2
+#             且标志干净时，单独不足以触发复核）。Server=Yes 计为机房票并列入风险。
 #   广播 IP、非 PBL 的 DNSBL 命中、启用源失败/超时/解析失败 → 至少复核。
 #   Spamhaus PBL（127.0.0.10/11）标为「PBL（家宽正常）」，不视为不干净。
 #   coffee 的 DNSBL 在对方服务器上查，不受本机 Clash fake-ip 干扰。
@@ -994,6 +995,8 @@ for name, s in sources.items():
 
 res_n = sum(1 for _, v, _ in type_voters if v == "res")
 host_n = sum(1 for _, v, _ in type_voters if v == "host")
+host_sources = [title for title, v, _ in type_voters if v == "host"]
+host_src_txt = "、".join(host_sources)
 flag_sources_n = len(flag_voters)
 
 failed = [s for s in sources.values() if s["enabled"] and not s["ok"]]
@@ -1136,16 +1139,22 @@ elif op_hit and op_hit["kind"] == "business":
 
 # 类型投票（res_eff 已含可能的运营商加分）
 type_pass = (res_eff >= 2 and res_eff > host_n)
-if host_n > res_n and host_n >= 2:
+host_majority = (host_n > res_n and host_n >= 2)
+if host_majority:
     # 机房多数按原始票数判断，加分不得覆盖
-    reject.append("类型投票：机房/IDC %d 票 vs 家宽/ISP %d 票，多数源判机房，建议放弃" % (host_n, res_n))
+    reject.append("类型投票：机房/IDC %d 票 vs 家宽/ISP %d 票，多数源判机房（%s），建议放弃" % (host_n, res_n, host_src_txt or "—"))
 elif not type_pass:
     review.append("类型投票未通过（家宽/ISP %d 票，机房/IDC %d 票；通过需至少 2 票家宽且多于机房票）" % (res_eff, host_n))
+    if host_n >= 2:
+        review.append("有 %d 个源判机房（%s）" % (host_n, host_src_txt))
 else:
     if bonus_applied and res_n < 2:
         notes.append("类型投票通过：家宽/ISP %d 票 + 主流运营商加分，机房/IDC %d 票" % (res_n, host_n))
     else:
         notes.append("类型投票通过：家宽/ISP %d 票，机房/IDC %d 票" % (res_n, host_n))
+    # 家宽仍占多数，但已有 ≥2 个源判机房（含仅多 1 票）→ 至少复核，不放弃
+    if host_n >= 2:
+        review.append("有 %d 个源判机房（%s），即使家宽仍占多数，也需复核" % (host_n, host_src_txt))
 
 # 代理/VPN/Tor
 if flag_sources_n >= 2:
@@ -1164,7 +1173,8 @@ if sc["ok"] and score is not None:
     if score > 25:
         reject.append("Scamalytics Fraud Score %d > 25，建议放弃" % score)
     elif score >= 11:
-        if type_pass and flag_sources_n == 0:
+        # 仅当类型明确为家宽、机房票 < 2、且无代理标志时，11–25 只作参考
+        if type_pass and flag_sources_n == 0 and host_n < 2:
             notes.append("Scamalytics Fraud Score %d（11–25，仅作参考；类型投票明确为家宽且标志干净，不单独触发复核）" % score)
         else:
             review.append("Scamalytics Fraud Score %d 处于 11–25，且类型投票不够明确或已有其他风险，需复核" % score)
@@ -1318,10 +1328,12 @@ def pick_first(*vals):
 
 def pts_type():
     # 0-35
-    if host_n > res_n and host_n >= 2:
+    if host_majority:
         return 0, "机房多数 %d:%d" % (res_n, host_n)
     if res_eff >= 2 and host_n == 0:
         return 35, "家宽 %d : 机房 0" % res_n
+    if type_pass and host_n >= 2:
+        return 15, "家宽 %d : 机房 %d（机房票偏多，需复核）" % (res_n, host_n)
     if type_pass and host_n > 0:
         return 25, "家宽 %d : 机房 %d（仍通过）" % (res_n, host_n)
     if res_eff > host_n:
@@ -1468,9 +1480,75 @@ if p_ab is not None:
 else:
     breakdown.append(("AbuseIPDB", 0, 0, d_ab))
 
-# 复核原因：源失败 vs 真实信号
+# 复核原因：源失败 vs 真实信号。仅当完全没有实际信号时，才写「仅检测源失败」。
 src_fail_reviews = [x for x in review if "启用源失败" in x or "fail-closed" in x]
 other_reviews = [x for x in review if x not in src_fail_reviews]
+failed_names = "、".join(s["title"] for s in failed)
+
+def real_signal_phrases():
+    phrases = []
+    if host_n >= 2:
+        phrases.append("有 %d 个源判机房（%s）" % (host_n, host_src_txt or "—"))
+    elif (not type_pass) and (not host_majority):
+        phrases.append("类型投票未通过（家宽 %d : 机房 %d）" % (res_eff, host_n))
+    sc0 = sources["scamalytics"]
+    sv = (sc0.get("_server") or "") if sc0["ok"] else ""
+    if str(sv).lower() in ("yes", "true", "1") and host_n < 2:
+        # Server=Yes 已计为机房票；仅在未并入「有 N 个源判机房」时单独写出
+        phrases.append("Scamalytics 标记 Server=Yes")
+    if flag_sources_n >= 2:
+        labs = "、".join("%s(%s)" % (t, "/".join(f)) for t, f in flag_voters)
+        phrases.append("多源代理/VPN/Tor 阳性（%s）" % labs)
+    elif flag_sources_n == 1:
+        t, f = flag_voters[0]
+        phrases.append("单源代理/VPN/Tor 标记（%s: %s）" % (t, "/".join(f)))
+    if sc0["ok"] and sc0.get("_score") is not None:
+        if sc0["_score"] > 25:
+            phrases.append("Scamalytics Fraud Score %d > 25" % sc0["_score"])
+        elif sc0["_score"] >= 11 and not (type_pass and flag_sources_n == 0 and host_n < 2):
+            phrases.append("Scamalytics Fraud Score %d 处于 11–25" % sc0["_score"])
+    for name, title in (("ipx", "ipx.al"), ("iping", "iping.cc")):
+        if sources[name]["ok"] and sources[name].get("_broadcast"):
+            phrases.append("%s 判定为广播 IP" % title)
+    if sources["coffee"]["ok"] and sources["coffee"].get("_broadcast_hint"):
+        phrases.append("ip.net.coffee 注册地与使用地不一致（非原生）")
+    cof0 = sources["coffee"]
+    if cof0.get("_dnsbl_ok") and cof0.get("_dnsbl_hits"):
+        phrases.append("DNSBL 命中非 PBL 名单")
+    ab0 = sources["abuseipdb"]
+    if ab0["enabled"] and ab0["ok"]:
+        try:
+            ascore_n = int(ab0.get("_abuse_score")) if ab0.get("_abuse_score") is not None else None
+        except (TypeError, ValueError):
+            ascore_n = None
+        try:
+            reps_n = int(ab0.get("_abuse_reports") or 0)
+        except (TypeError, ValueError):
+            reps_n = 0
+        if (ascore_n is not None and ascore_n >= 25) or reps_n >= 5:
+            phrases.append("AbuseIPDB 需复核")
+    # IPLogs 非 clean 已在代理标记里覆盖时不再重复
+    il0 = sources["iplogs"]
+    if il0["ok"]:
+        verd = il0.get("_verdict")
+        if verd and norm(verd) not in ("clean", "allow", "allowlist"):
+            already = flag_sources_n > 0 and any(t == il0["title"] for t, _ in flag_voters)
+            if not already:
+                phrases.append("IPLogs verdict=%s（非 clean）" % verd)
+    if rdns_host_strong and not rdns_res and not type_pass:
+        phrases.append("rDNS 呈机房风格")
+    return phrases
+
+signal_phrases = real_signal_phrases()
+# 判定依据里还有、但上面没结构化到的实际复核项，补进原因，避免漏信号
+structured_markers = ("有 %d 个源判机房" % host_n, "类型投票未通过", "代理/VPN/Tor",
+                      "Scamalytics Fraud Score", "Scamalytics 标记", "广播", "非原生",
+                      "DNSBL", "AbuseIPDB", "IPLogs verdict", "rDNS 呈机房")
+for x in other_reviews:
+    if any(m in x for m in structured_markers):
+        continue
+    signal_phrases.append(x)
+
 if code == 0:
     conclusion = "留"
     review_reason = "pass"
@@ -1481,12 +1559,15 @@ elif code == 3:
     why_review = ""
 else:
     conclusion = "待复核"
-    if src_fail_reviews and not other_reviews:
+    if not signal_phrases and (src_fail_reviews or failed):
         review_reason = "source_failure"
-        why_review = "待复核是因为检测源失败，不是这份 IP 本身的类型或标志问题"
-    elif src_fail_reviews and other_reviews:
+        why_review = "仅检测源失败（%s），不是这份 IP 本身的类型或标志问题" % (failed_names or "检测源")
+    elif signal_phrases and (src_fail_reviews or failed):
         review_reason = "mixed"
-        why_review = "既有检测源失败，也有需要确认的实际信号"
+        why_review = "%s；另有检测源失败（%s）" % ("；".join(signal_phrases), failed_names or "检测源")
+    elif signal_phrases:
+        review_reason = "signal"
+        why_review = "；".join(signal_phrases)
     else:
         review_reason = "signal"
         why_review = "待复核是因为检测到需要人工确认的信号"
@@ -1498,10 +1579,13 @@ if res_n >= 2 and host_n == 0:
     pros.append("类型投票明确为家宽（%d 票，机房 0）" % res_n)
 elif type_pass:
     pros.append("类型投票通过（家宽 %d : 机房 %d）" % (res_n, host_n))
-if host_n > res_n and host_n >= 2:
-    cons.append("多数源判机房（家宽 %d : 机房 %d）" % (res_n, host_n))
+if host_majority:
+    cons.append("多数源判机房（家宽 %d : 机房 %d；%s）" % (res_n, host_n, host_src_txt or "—"))
 elif host_n > 0:
-    cons.append("有机房票（%d）" % host_n)
+    cons.append("有 %d 个源判机房（%s）" % (host_n, host_src_txt or "—"))
+sc_sv = (sources["scamalytics"].get("_server") or "") if sources["scamalytics"]["ok"] else ""
+if str(sc_sv).lower() in ("yes", "true", "1"):
+    cons.append("Scamalytics 标记 Server=Yes")
 if bonus_applied:
     mob = "，移动网络" if (op_hit or {}).get("mobile") else ""
     pros.append("主流家宽运营商 %s%s" % (op_hit["brand"], mob))
@@ -1518,7 +1602,10 @@ if sc["ok"] and sc.get("_score") is not None:
     if sc["_score"] <= 10:
         pros.append("Scamalytics Fraud Score %d（低）" % sc["_score"])
     elif sc["_score"] <= 25:
-        pros.append("Scamalytics Fraud Score %d（中段，仅作参考）" % sc["_score"])
+        if type_pass and flag_sources_n == 0 and host_n < 2:
+            pros.append("Scamalytics Fraud Score %d（中段，仅作参考）" % sc["_score"])
+        else:
+            cons.append("Scamalytics Fraud Score %d（11–25，需复核）" % sc["_score"])
     else:
         cons.append("Scamalytics Fraud Score %d（>25）" % sc["_score"])
 if p_nat == 5:
@@ -1557,7 +1644,7 @@ elif cof.get("_dnsbl_ok") and not cof.get("_dnsbl_hits"):
 if code == 0:
     suggestion = "留：" + ("、".join(bits) if bits else "类型与标志均通过")
 elif code == 3:
-    if host_n > res_n and host_n >= 2:
+    if host_majority:
         suggestion = "换：多数源判机房"
     elif flag_sources_n >= 2:
         suggestion = "换：多源代理/VPN/Tor 阳性"
@@ -1567,9 +1654,12 @@ elif code == 3:
         suggestion = "换：" + (reject[0] if reject else "达到放弃线")
 else:
     if review_reason == "source_failure":
-        suggestion = "待复核：检测源失败（%s），类型与标志本身偏向留；源恢复后可重测" % "、".join(s["title"] for s in failed)
-    elif review_reason == "mixed":
-        suggestion = "待复核：源失败且存在需确认的信号，不建议直接留"
+        suggestion = "待复核：仅检测源失败（%s），类型与标志本身偏向留；源恢复后可重测" % (failed_names or "检测源")
+    elif signal_phrases:
+        suggestion = "待复核：" + "；".join(signal_phrases)
+        if review_reason == "mixed" and failed_names:
+            suggestion += "；另有检测源失败（%s）" % failed_names
+        suggestion += "，不建议直接留"
     else:
         suggestion = "待复核：" + (other_reviews[0] if other_reviews else (review[0] if review else "需要人工确认"))
 
