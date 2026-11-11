@@ -3,7 +3,7 @@ name: vps-node
 description: Pre-flight a freshly bought VPS (hardware / IP reputation / return route, nothing installed) and only then provision a production-ready proxy node — sing-box (VLESS+REALITY :443 + Hysteria2 :8443), BBR tuning, DuckDNS + Let's Encrypt HTTPS subscription endpoint, security hardening (ufw/SSH/sysctl/fail2ban), and a 9-source external IP reputation audit. Use when the user buys a new VPS, wants to set up a 节点/机场/梯子, replace a residential proxy node, or asks to harden + audit a VPS.
 description_zh: "新 VPS 上线全流程：先验货（硬件/IP 质量/回程，不装机）→ sing-box 双协议节点 + BBR + 免费域名 HTTPS 订阅 + 安全加固 + IP 风险体检 → 验收 → 服务端哨兵"
 description_en: "One-shot VPS node deployment: sing-box dual protocol, BBR, HTTPS subscription via DuckDNS+LE, hardening, IP reputation audit"
-version: 1.10.1
+version: 1.10.2
 allowed-tools: Read,Write,Edit,Bash
 display_name: "VPS 节点上线"
 visibility: "public"
@@ -341,15 +341,31 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
   "version": "5", "username": "<user>", "password": "<pass>" }
 ```
 
-`route.final` 指向它，但**必须加一条 UDP 直连规则**排在前面：
+`route.final` 指向它。Webshare 的 SOCKS5 不转 UDP，所以 UDP 只能直连；但**直连之前必须先拦掉 QUIC 和 STUN**，否则 HTTP/3、WebRTC 会绕过住宅 IP、直接暴露机房 IP（需 sing-box ≥ 1.11 的 rule action，init 装的版本满足）：
 
 ```json
-"route": { "rules": [ { "network": "udp", "outbound": "direct" } ], "final": "webshare-us" }
+"route": {
+  "rules": [
+    { "action": "sniff" },
+    { "protocol": "quic", "action": "reject" },
+    { "network": "udp", "port": 443, "action": "reject" },
+    { "protocol": "stun", "action": "reject" },
+    { "network": "udp", "outbound": "direct" }
+  ],
+  "final": "webshare-us"
+}
 ```
 
-**3. 必须知道的三件事**：
+- `sniff` 先识别协议，后面才能按 `quic` / `stun` 匹配；`udp 443` 那条兜底没被识别出来的 QUIC
+- QUIC 被拒后浏览器和 App 会自动回落到 HTTP/2 over TCP，于是走 `final` 从住宅 IP 出去
+- DNS 也别从机房 IP 直出：DoH/DoT 服务器加 `"detour": "webshare-us"`
+- 改完 `sing-box check -c /etc/sing-box/config.json` 通过再重启
 
-- **SOCKS5 ≠ 支持 UDP**：Webshare 的 SOCKS5 只代理 TCP，UDP ASSOCIATE 会被拒（日志报 `socks5: request rejected, code=7`）。上面那条 UDP→direct 规则就是为此而加，QUIC 从机房 IP 直连出去即可，无风控问题
+**3. 必须知道的几件事**：
+
+- **SOCKS5 ≠ 支持 UDP**：Webshare 的 SOCKS5 只代理 TCP，UDP ASSOCIATE 会被拒（日志报 `socks5: request rejected, code=7`）。只留一条 UDP→direct 是**不够的**：QUIC/HTTP3（Google、YouTube、Cloudflare 站点默认走它）和 WebRTC/STUN 会从机房 IP 直出，目标站看到的就是机房 IP，住宅出口形同虚设。所以要按上面的顺序先 reject QUIC/STUN。浏览器端的 WebRTC 防泄漏只管那一个浏览器，App 和其他设备照样漏，服务端规则不能省
+- **拦 QUIC 的代价**：没有 HTTP/3，首连略慢、弱网下 YouTube 起播/拖动可能慢一点；回落的 TCP 流量全部计入住宅额度；网页视频会议改走 TURN/TCP 中继，延迟略高。游戏、非 443 的语音等其他 UDP 仍直连，不受影响
+- **真要 UDP 也走干净 IP**：只能换支持 UDP 的上游（带 UDP ASSOCIATE 的 SOCKS5，或另一台干净 IP 机器上的 Hysteria2/WireGuard），Webshare 做不到
 - **按流量计费**：final 指过去之后所有 TCP 流量都烧住宅套餐额度，跑满即断网。介意就把 final 留在 direct，用按域名的 rules 只分流 AI 站
 - **延迟 +60-90ms**：多一跳 VPS→代理落地的绕行（实测：洛杉矶→阿什本 73ms、洛杉矶→湾区 13ms，节点总延迟差 60-90ms）
 
@@ -359,7 +375,7 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 - `config.json` 现在**含代理密码**，`chmod 600`
 - 凭据里顺手记一个 `webshare: {host, port, user, pass, since}` 块，换机重配或回滚都从这抄
 
-**回滚**：还原 `/etc/sing-box/config.json.bak-before-webshare` 并重启；或删掉 `webshare-us` 出站、`route.final` 改回 `direct`、删掉 UDP 规则。凭据里的 `egress_ip` 字段同步删掉。
+**回滚**：还原 `/etc/sing-box/config.json.bak-before-webshare` 并重启；或删掉 `webshare-us` 出站、`route.final` 改回 `direct`、删掉上面那组 sniff/reject/UDP 规则。凭据里的 `egress_ip` 字段同步删掉。只想恢复 HTTP/3 的话，单独删掉 `quic` 和 `udp 443` 两条 reject 即可（代价是 QUIC 重新从机房 IP 漏出）。
 
 ### 双出口主备（同一商家买多条 IP）
 

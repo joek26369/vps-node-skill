@@ -98,7 +98,7 @@ cp .github/sensitive-blocklist.local.txt.example .github/sensitive-blocklist.loc
 - **验货在设计上只读**：`vps-precheck.sh` 不写远端文件、不装软件，退出码 `0`（合格）/ `1`（有警告）/ `2`（不合格）
 - **不碰节点结构做增值改造**：挂住宅上游、加第二出口都只改 `outbounds` / `route`，443 / REALITY / 订阅一律不动，回滚是还原一个备份文件
 - **哨兵是双层**：VPS 侧 cron 每 10 分钟写一条 JSONL（Mac 关机不影响采集），Mac 侧开机拉取 + 本机复测 + 异常聚合
-- **UDP 单独处理**：多数住宅代理只代理 TCP，SOCKS5 UDP ASSOCIATE 会被拒，所以固定加一条 `{"network":"udp","outbound":"direct"}` 规则排在路由最前
+- **UDP 单独处理**：多数住宅代理只代理 TCP，SOCKS5 UDP ASSOCIATE 会被拒，所以 UDP 只能直连；但直连前先 `sniff` 并 reject QUIC、UDP 443 和 STUN，迫使 HTTP/3、WebRTC 回落到 TCP 走住宅出口，避免从机房 IP 泄漏（规则见 SKILL.md「挂住宅上游出口」）
 
 ## 已知限制
 
