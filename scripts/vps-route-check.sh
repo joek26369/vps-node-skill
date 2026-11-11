@@ -9,6 +9,8 @@ set -uo pipefail
 IP="${1:?用法: vps-route-check.sh <VPS_IP> [SSH端口] [国内目标IP]}"
 PORT="${2:-22}"
 TARGET="${3:-114.114.114.114}"
+case "$TARGET" in ''|*[!0-9A-Za-z.:-]*) echo "国内目标不合法: $TARGET"; exit 2 ;; esac
+case "$PORT" in ''|*[!0-9]*) echo "SSH 端口不合法: $PORT"; exit 2 ;; esac
 KEY="${SSH_KEY:-}"
 if [ -z "$KEY" ]; then
   for k in "$HOME/.ssh/id_ed25519_vps" "$HOME"/.ssh/id_ed25519_* \
@@ -70,7 +72,11 @@ echo "  SSH 登录并探测中（最多 120s）..."
 RC=$(run_to 130 ssh $SSHOPT "root@$IP" bash -s 2>&1 <<REMOTE
 set -u
 if ! command -v nexttrace >/dev/null 2>&1; then
-  curl -sL --max-time 60 nxtrace.org/nt | bash >/dev/null 2>&1 || true
+  NXT=\$(mktemp /tmp/nxt.XXXXXX)
+  if curl -fsSL --proto '=https' --max-time 60 https://nxtrace.org/nt -o "\$NXT" 2>/dev/null && [ -s "\$NXT" ]; then
+    bash "\$NXT" >/dev/null 2>&1 || true
+  fi
+  rm -f "\$NXT"
 fi
 if command -v nexttrace >/dev/null 2>&1; then
   echo "=== nexttrace（缺省 ICMP，每跳 2 探测）==="

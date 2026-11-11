@@ -50,6 +50,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 # ---------------------------------------------------------------- SSH 传输层
 if [ -n "$KEY" ]; then
+  [ -f "$KEY" ] || { echo "找不到私钥: $KEY"; exit 2; }
+  case "$KEY" in *[[:space:]]*) echo "私钥路径不能含空格: $KEY"; exit 2 ;; esac
   SSHBASE="-i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
   ssh_run() { ssh $SSHBASE -o ConnectTimeout=15 -o BatchMode=yes -p "$PORT" "root@$IP" "$@" 2>&1 | grep -vE '^Warning: Permanently'; }
   scp_run() { scp $SSHBASE -P "$PORT" "$1" "root@$IP:$2"; }
@@ -131,7 +133,7 @@ fi
 echo "NET_GITHUB=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 https://github.com 2>/dev/null || echo 000)"
 echo "NET_CLOUDFLARE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://speed.cloudflare.com 2>/dev/null || echo 000)"
 # 出口 IP 与归属（VPS 自己的视角）
-echo "EGRESS_JSON=$(curl -s --max-time 12 'http://ip-api.com/json/?fields=status,country,regionName,city,isp,org,as,proxy,hosting' 2>/dev/null | tr -d '\n')"
+echo "EGRESS_JSON=$(curl -s --max-time 12 'http://ip-api.com/json/?fields=status,query,country,regionName,city,isp,org,as,proxy,hosting' 2>/dev/null | tr -d '\n')"
 # AI 站落地风控：从本机直连（不经节点），反映这个 IP 本身的信誉
 # 关键：裸 curl 没有浏览器指纹，403 不代表被封；要区分「Cloudflare 挑战」与普通拒绝
 UAX='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
@@ -161,7 +163,12 @@ fi
 # 回程 AS 路径：优先 nexttrace（mtr --aslookup 对无 PTR 的跳显示 AS???，
 # 会把 AS10099/AS9929 这类精品段吞掉，导致误判"没有精品线路"）
 if ! command -v nexttrace >/dev/null 2>&1; then
-  curl -sL --max-time 60 nxtrace.org/nt 2>/dev/null | bash >/dev/null 2>&1 || true
+  # https 下载到临时文件再执行（不走明文 http，也不直接 curl | bash）
+  NXT=$(mktemp /tmp/nxt.XXXXXX)
+  if curl -fsSL --proto '=https' --max-time 60 https://nxtrace.org/nt -o "$NXT" 2>/dev/null && [ -s "$NXT" ]; then
+    bash "$NXT" >/dev/null 2>&1 || true
+  fi
+  rm -f "$NXT"
 fi
 if command -v nexttrace >/dev/null 2>&1; then
   echo "TRACE_TOOL=nexttrace"
@@ -206,7 +213,9 @@ if [ "$UP" -ne 0 ]; then
   fi
 fi
 
-RAW=$(ssh_run "SKIP_NET_IO='$SKIP_NET_IO' SKIP_SPEED='$SKIP_SPEED' bash /tmp/.vps-precheck-remote.sh '$TARGET'; rm -f /tmp/.vps-precheck-remote.sh" 2>&1)
+case "$TARGET" in ''|*[!0-9A-Za-z.:-]*) echo "TARGET 不合法: $TARGET"; exit 2 ;; esac
+case "$SKIP_NET_IO$SKIP_SPEED" in *[!0-9]*) echo "SKIP_NET_IO / SKIP_SPEED 只能是 0/1"; exit 2 ;; esac
+RAW=$(ssh_run "SKIP_NET_IO=$SKIP_NET_IO SKIP_SPEED=$SKIP_SPEED bash /tmp/.vps-precheck-remote.sh $TARGET; rm -f /tmp/.vps-precheck-remote.sh" 2>&1)
 if [ -z "$RAW" ]; then
   echo ""
   echo "❌ 远端执行无输出 —— SSH 认证失败或 root 无 bash"
@@ -360,6 +369,10 @@ fi
 [ "$PXC_RISK" != "" ] && awk -v v="$PXC_RISK" 'BEGIN{exit !(v+0 >= 40)}' 2>/dev/null && \
   warn "proxycheck 风险分 ${PXC_RISK}/100（>=40），AI 站可能要求人机验证"
 [ "$IP_PROXY" = "True" ] || [ "$IP_PROXY" = "true" ] && warn "ip-api 标记为代理出口（proxy=yes），对 Claude/ChatGPT 风控不利"
+# 出口 IP（VPS 自己看到的）应等于购买 IP；不一致多半是上游 NAT 或 IP 被换
+EG_IP=""
+[ -n "$EGRESS_JSON" ] && EG_IP=$(J "$EGRESS_JSON" "query")
+[ -n "$EG_IP" ] && [ "$EG_IP" != "$IP" ] && fail "VPS 出口 IP ${EG_IP} 与购买 IP ${IP} 不一致（上游 NAT 或 IP 被换，先问商家）"
 [ -z "$RET_BOUTIQUE" ] && warn "回程未见 9929 / 4809 / CUG / CMIN2 精品段（AS: ${RET_AS:-未知}），高峰可能绕路"
 
 # AI 站可达性（本机直连，不经节点）
@@ -424,11 +437,7 @@ if [ -n "$PXC_RISK" ]; then
 else
   row "proxycheck" "无响应（限额或网络）"
 fi
-if [ -n "$EGRESS_JSON" ]; then
-  EG_IP=$(J "$EGRESS_JSON" "query")
-  [ -z "$EG_IP" ] && EG_IP=$(curl -s --max-time 6 https://api.ip.sb/ip 2>/dev/null | tr -d ' \n')
-  row "出口 IP" "${EG_IP:-?}$([ -n "$EG_IP" ] && [ "$EG_IP" != "$IP" ] && echo '   ← 与购买 IP 不一致！')"
-fi
+row "出口 IP" "${EG_IP:-?（VPS 侧查询失败）}$([ -n "$EG_IP" ] && [ "$EG_IP" != "$IP" ] && echo '   ← 与购买 IP 不一致！')"
 
 echo ""
 echo "────────────── AI 站可达性（VPS 本机直连，不经节点）──────────────"
@@ -472,7 +481,7 @@ if [ -n "$FAILS" ]; then
   echo ""
   echo "  ❌ 不建议部署 —— 先联系商家换 IP / 换机器 / 退款，再回来跑部署"
   [ -n "$IPAUDIT_LOG" ] && echo "  📄 IP 体检报告: $IPAUDIT_LOG"
-  [ -n "$IPAUDIT_LOG" ] && echo "  📄 IP 体检报告: $IPAUDIT_LOG"
+  [ -n "$DEEP_LOG" ] && echo "  📄 深度报告: $DEEP_LOG"
   [ "$FORCE" = "1" ] && { echo "  （FORCE=1，仍继续）"; exit 0; }
   exit 2
 elif [ -n "$WARNS" ]; then
