@@ -29,7 +29,10 @@
 #             并让 Scamalytics 11–25 仅作参考。不加分不覆盖机房多数、代理/VPN/Tor、
 #             DNSBL、AbuseIPDB、广播、Fraud Score >25。商业线与无消费侧证据的 AS701 不加分。
 #
-# 退出码: 0 通过（可进入下一步）/ 1 需人工复核 / 3 放弃 / 2 参数错误
+# 每次跑完会追加「情况分析」块（留 / 换 / 待复核 + 综合分），并写入
+#   ~/.vps-node/ipaudits/<IP>/lite-<stamp>.json（600），供 ip-compare.sh 汇总比较。
+#
+# 退出码: 0 通过（留）/ 1 需人工复核 / 3 放弃（换）/ 2 参数错误
 #
 # 测试用 URL 覆盖（完整 URL，用于 fail-closed 自测）:
 #   IPCHECK_IPINFO_URL IPCHECK_IPLOGS_URL IPCHECK_SCAMALYTICS_URL
@@ -174,12 +177,15 @@ export ABUSE_SKIP_MSG
 
 # ---- 日志目录（600）----
 umask 077
-STAMP=$(date +%Y%m%d-%H%M)
+STAMP=$(date +%Y%m%d-%H%M%S)
 SAVEDIR="${HOME}/.vps-node/ipaudits/${IP}"
 mkdir -p "$SAVEDIR"
 LOG="$SAVEDIR/lite-${STAMP}.log"
+JSON_OUT="$SAVEDIR/lite-${STAMP}.json"
 : > "$LOG"
-chmod 600 "$LOG" 2>/dev/null || true
+: > "$JSON_OUT"
+chmod 600 "$LOG" "$JSON_OUT" 2>/dev/null || true
+WHEN=$(date '+%Y-%m-%dT%H:%M:%S%z')
 
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/ip-check-lite.XXXXXX")
 # shellcheck disable=SC2329  # invoked via trap EXIT
@@ -291,6 +297,8 @@ done
   printf 'abuse_enabled=%s\n' "$ABUSE_ENABLED"
   printf 'abuse_skip=%s\n' "$ABUSE_SKIP_MSG"
   printf 'ip=%s\n' "$IP"
+  printf 'timestamp=%s\n' "$WHEN"
+  printf 'json_path=%s\n' "$JSON_OUT"
 } > "$WORKDIR/meta.txt"
 
 # 清掉环境里的 key，防止任何子进程或调试输出带出
@@ -384,7 +392,7 @@ def parse_asn(val):
         return int(s)
     return None
 
-def add_ident(s, *texts, asn=None):
+def add_ident(s, *texts, asn=None, city=None, country=None):
     for x in texts:
         if x is None:
             continue
@@ -399,6 +407,10 @@ def add_ident(s, *texts, asn=None):
         n = parse_asn(asn)
         if n:
             s.setdefault("asns", []).append(n)
+    if city and str(city).strip() and str(city).strip().lower() not in ("?", "n/a", "none", "null"):
+        s["city"] = str(city).strip()
+    if country and str(country).strip() and str(country).strip().lower() not in ("?", "n/a", "none", "null"):
+        s["country"] = str(country).strip()
 
 def read(path, default=""):
     try:
@@ -492,6 +504,9 @@ def rdns_signal(hostname):
     if not hostname or hostname in ("?", "(无)", "null", "None"):
         return None, None
     h = hostname.strip()
+    # 商业线主机名不当作家宽风格（例如 comcastbusiness.net、uu.net）
+    if re.search(r"comcastbusiness|uu\.net|alter\.net", h, re.I):
+        return None, h
     res = bool(RES_RDNS.search(h))
     host_strong = bool(HOST_RDNS.search(h))
     host_weak = bool(HOST_RDNS_WEAK.search(h))
@@ -524,6 +539,8 @@ def add(name, title):
         "hostnames": [],
         "org_texts": [],
         "asns": [],
+        "city": None,
+        "country": None,
         "notes": [],
     }
     return sources[name]
@@ -555,7 +572,7 @@ else:
             s["detail_lines"].append("  %s: %s" % (k, d.get(k)))
         if d.get("hostname"):
             s["hostnames"].append(d.get("hostname"))
-        add_ident(s, d.get("org"), asn=d.get("org") or d.get("asn"))
+        add_ident(s, d.get("org"), asn=d.get("org") or d.get("asn"), city=d.get("city"), country=d.get("country"))
 
 # ---- IPLogs ----
 s = add("iplogs", "IPLogs")
@@ -582,7 +599,7 @@ else:
         s["detail_lines"].append(
             "  type: %s | asn: %s %s" % (typ, ii.get("asn"), ii.get("org"))
         )
-        add_ident(s, ii.get("org"), ii.get("isp"), asn=ii.get("asn"))
+        add_ident(s, ii.get("org"), ii.get("isp"), asn=ii.get("asn"), city=ii.get("city"), country=ii.get("country") or ii.get("country_code"))
         for sig in (d.get("signals") or [])[:8]:
             s["detail_lines"].append(
                 "  signal: %s | weight: %s" % (sig.get("type"), sig.get("weight"))
@@ -716,7 +733,7 @@ else:
         if d.get("rdns"):
             s["hostnames"].append(d.get("rdns"))
             s["detail_lines"].append("  rdns: %s" % d.get("rdns"))
-        add_ident(s, d.get("company_name"), d.get("asOrganization"), d.get("asname"), d.get("isp"), asn=d.get("asn"))
+        add_ident(s, d.get("company_name"), d.get("asOrganization"), d.get("asname"), d.get("isp"), asn=d.get("asn"), city=d.get("city"), country=d.get("country") or d.get("countryCode"))
         s["detail_lines"].append(
             "  vpn: %s | proxy: %s | tor: %s | trust_score: %s | abuser_score: %s"
             % (d.get("is_vpn"), d.get("is_proxy"), d.get("is_tor"), d.get("trust_score"), d.get("abuser_score") or "—")
@@ -818,7 +835,8 @@ else:
             s["hostnames"].append(d["hostname"])
             s["detail_lines"].append("  hostname: %s" % d["hostname"])
         net = d.get("network") or {}
-        add_ident(s, d.get("org"), net.get("company"), asn=d.get("asn"))
+        loc = d.get("location") or {}
+        add_ident(s, d.get("org"), net.get("company"), asn=d.get("asn"), city=loc.get("city"), country=loc.get("country"))
         if net.get("humanPct") is not None:
             s["detail_lines"].append("  humanPct: %s%%" % net.get("humanPct"))
         ipdb = d.get("ipdb") or {}
@@ -899,7 +917,7 @@ else:
             "  isp: %s | is_proxy: %s | risk_score: %s"
             % (data.get("isp"), data.get("is_proxy"), data.get("risk_score"))
         )
-        add_ident(s, data.get("isp"), data.get("as_owner"), data.get("company"), asn=data.get("asn"))
+        add_ident(s, data.get("isp"), data.get("as_owner"), data.get("company"), asn=data.get("asn"), city=data.get("city"), country=data.get("country"))
         cu, ca, cc = classify_label(usage), classify_label(as_type), classify_label(company_type)
         votes = [v for v in (cu, ca, cc) if v]
         if "host" in votes and "res" in votes:
@@ -1287,6 +1305,365 @@ elif review:
 else:
     code = 0
     print("判定: 快查通过 → 下一步用代理凭据跑 ip-audit.sh 完整体检")
+
+# ---------- 综合分与情况分析 ----------
+def pick_first(*vals):
+    for v in vals:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s and s.lower() not in ("none", "null", "?", "n/a", "na", "-"):
+            return s
+    return None
+
+def pts_type():
+    # 0-35
+    if host_n > res_n and host_n >= 2:
+        return 0, "机房多数 %d:%d" % (res_n, host_n)
+    if res_eff >= 2 and host_n == 0:
+        return 35, "家宽 %d : 机房 0" % res_n
+    if type_pass and host_n > 0:
+        return 25, "家宽 %d : 机房 %d（仍通过）" % (res_n, host_n)
+    if res_eff > host_n:
+        return 15, "家宽占优但未达通过线 %d:%d" % (res_eff, host_n)
+    if res_n == host_n and (res_n + host_n) > 0:
+        return 8, "打平 %d:%d" % (res_n, host_n)
+    return 5, "家宽 %d : 机房 %d" % (res_n, host_n)
+
+def pts_bonus():
+    if bonus_applied:
+        return 10, (op_hit or {}).get("brand", "是")
+    if op_hit and op_hit.get("kind") == "bonus":
+        return 0, "%s（有机房票，未计入）" % op_hit.get("brand")
+    if op_hit and op_hit.get("kind") == "business":
+        return 0, "%s 商业线，不加分" % op_hit.get("brand")
+    return 0, "无"
+
+def pts_flags():
+    n = flag_sources_n
+    if n <= 0:
+        return 15, "无"
+    if n == 1:
+        t, f = flag_voters[0]
+        return 5, "单源 %s(%s)" % (t, "/".join(f))
+    labs = "、".join("%s(%s)" % (t, "/".join(f)) for t, f in flag_voters)
+    return 0, "%d 源阳性：%s" % (n, labs)
+
+def pts_scam():
+    sc = sources["scamalytics"]
+    score = sc.get("_score") if sc["ok"] else None
+    if not sc["ok"] or score is None:
+        return 8, "未取到分数"
+    if score > 25:
+        return 0, "%d（>25）" % score
+    if score >= 11:
+        return 10, "%d（11–25，参考）" % score
+    return 15, "%d（低）" % score
+
+def pts_native():
+    bc = False
+    labels = []
+    if sources["ipx"]["ok"]:
+        if sources["ipx"].get("_broadcast"):
+            bc = True
+            labels.append("ipx 广播")
+        else:
+            labels.append("ipx 原生")
+    if sources["iping"]["ok"]:
+        if sources["iping"].get("_broadcast"):
+            bc = True
+            labels.append("iping 广播")
+        else:
+            labels.append("iping 原生")
+    if sources["coffee"]["ok"] and sources["coffee"].get("_broadcast_hint"):
+        bc = True
+        labels.append("coffee 非原生")
+    if not labels:
+        return 3, "未知"
+    if bc:
+        return 0, "；".join(labels)
+    return 5, "原生"
+
+def pts_dnsbl():
+    cof = sources["coffee"]
+    if not cof.get("_dnsbl_ok"):
+        return 3, "未测到"
+    if cof.get("_dnsbl_hits"):
+        return 0, "命中 " + "; ".join(cof["_dnsbl_hits"])
+    if cof.get("_dnsbl_pbl"):
+        return 5, "仅 PBL（家宽正常）"
+    return 5, "未列"
+
+def pts_rdns():
+    if rdns_host_strong and not rdns_res:
+        hs = [h for h, sig in rdns_votes if sig == "host"]
+        return 0, "机房风格 " + (hs[0] if hs else "")
+    if rdns_res:
+        hs = [h for h, sig in rdns_votes if sig == "res"]
+        return 5, "家宽风格 " + (hs[0] if hs else "")
+    if hostnames:
+        return 2, hostnames[0]
+    return 2, "无"
+
+def pts_sources():
+    n = len(failed)
+    left = max(0, 10 - 8 * n)
+    if n == 0:
+        return 10, "全部源成功"
+    names = "、".join(s["title"] for s in failed)
+    return left, "%s 失败" % names
+
+def pts_abuse():
+    ab = sources["abuseipdb"]
+    if not ab["enabled"]:
+        return None, "未配置，不计入"
+    if not ab["ok"]:
+        return -0, "查询失败（已计入源失败）"
+    ascore = ab.get("_abuse_score")
+    reps = ab.get("_abuse_reports") or 0
+    try:
+        ascore_n = int(ascore) if ascore is not None else None
+    except (TypeError, ValueError):
+        ascore_n = None
+    try:
+        reps_n = int(reps)
+    except (TypeError, ValueError):
+        reps_n = 0
+    if ascore_n is not None and ascore_n >= 75:
+        return -15, "score %s，放弃线" % ascore_n
+    if (ascore_n is not None and ascore_n >= 25) or reps_n >= 5:
+        return -8, "score=%s reports=%s" % (ascore, reps)
+    return 0, "干净（score=%s reports=%s）" % (ascore, reps)
+
+p_type, d_type = pts_type()
+p_bonus, d_bonus = pts_bonus()
+p_flags, d_flags = pts_flags()
+p_scam, d_scam = pts_scam()
+p_nat, d_nat = pts_native()
+p_bl, d_bl = pts_dnsbl()
+p_rdns, d_rdns = pts_rdns()
+p_src, d_src = pts_sources()
+p_ab, d_ab = pts_abuse()
+
+score_total = p_type + p_bonus + p_flags + p_scam + p_nat + p_bl + p_rdns + p_src
+if p_ab is not None:
+    score_total += p_ab
+if score_total < 0:
+    score_total = 0
+if score_total > 100:
+    score_total = 100
+
+breakdown = [
+    ("类型投票", p_type, 35, d_type),
+    ("主流运营商加分", p_bonus, 10, d_bonus),
+    ("代理/VPN/Tor", p_flags, 15, d_flags),
+    ("Scamalytics", p_scam, 15, d_scam),
+    ("原生/广播", p_nat, 5, d_nat),
+    ("DNSBL", p_bl, 5, d_bl),
+    ("rDNS", p_rdns, 5, d_rdns),
+    ("源完整性", p_src, 10, d_src),
+]
+if p_ab is not None:
+    breakdown.append(("AbuseIPDB", p_ab, 0, d_ab))
+else:
+    breakdown.append(("AbuseIPDB", 0, 0, d_ab))
+
+# 复核原因：源失败 vs 真实信号
+src_fail_reviews = [x for x in review if "启用源失败" in x or "fail-closed" in x]
+other_reviews = [x for x in review if x not in src_fail_reviews]
+if code == 0:
+    conclusion = "留"
+    review_reason = "pass"
+    why_review = ""
+elif code == 3:
+    conclusion = "换"
+    review_reason = "reject"
+    why_review = ""
+else:
+    conclusion = "待复核"
+    if src_fail_reviews and not other_reviews:
+        review_reason = "source_failure"
+        why_review = "待复核是因为检测源失败，不是这份 IP 本身的类型或标志问题"
+    elif src_fail_reviews and other_reviews:
+        review_reason = "mixed"
+        why_review = "既有检测源失败，也有需要确认的实际信号"
+    else:
+        review_reason = "signal"
+        why_review = "待复核是因为检测到需要人工确认的信号"
+
+# 优缺点
+pros = []
+cons = []
+if res_n >= 2 and host_n == 0:
+    pros.append("类型投票明确为家宽（%d 票，机房 0）" % res_n)
+elif type_pass:
+    pros.append("类型投票通过（家宽 %d : 机房 %d）" % (res_n, host_n))
+if host_n > res_n and host_n >= 2:
+    cons.append("多数源判机房（家宽 %d : 机房 %d）" % (res_n, host_n))
+elif host_n > 0:
+    cons.append("有机房票（%d）" % host_n)
+if bonus_applied:
+    mob = "，移动网络" if (op_hit or {}).get("mobile") else ""
+    pros.append("主流家宽运营商 %s%s" % (op_hit["brand"], mob))
+elif op_hit and op_hit.get("kind") == "business":
+    cons.append("运营商为 %s 商业线，未加分" % op_hit["brand"])
+if flag_sources_n == 0 and sources["iplogs"]["ok"]:
+    pros.append("无代理 / VPN / Tor 标记")
+elif flag_sources_n == 1:
+    cons.append("单源代理/VPN/Tor 标记")
+elif flag_sources_n >= 2:
+    cons.append("多源代理/VPN/Tor 阳性")
+sc = sources["scamalytics"]
+if sc["ok"] and sc.get("_score") is not None:
+    if sc["_score"] <= 10:
+        pros.append("Scamalytics Fraud Score %d（低）" % sc["_score"])
+    elif sc["_score"] <= 25:
+        pros.append("Scamalytics Fraud Score %d（中段，仅作参考）" % sc["_score"])
+    else:
+        cons.append("Scamalytics Fraud Score %d（>25）" % sc["_score"])
+if p_nat == 5:
+    pros.append("判定为原生 IP")
+elif p_nat == 0:
+    cons.append("广播或非原生")
+cof = sources["coffee"]
+if cof.get("_dnsbl_ok"):
+    if cof.get("_dnsbl_hits"):
+        cons.append("DNSBL 命中非 PBL 名单")
+    elif cof.get("_dnsbl_pbl"):
+        pros.append("黑名单仅 Spamhaus PBL（家宽正常）")
+    else:
+        pros.append("DNSBL 未列")
+if rdns_res:
+    pros.append("rDNS 呈家宽风格")
+if rdns_host_strong and not rdns_res:
+    cons.append("rDNS 呈机房风格")
+if failed:
+    cons.append("检测源失败: " + "、".join(s["title"] for s in failed))
+
+# 一句建议
+brand = (op_hit or {}).get("brand") if (op_hit and op_hit.get("kind") == "bonus") else None
+bits = []
+if brand:
+    bits.append("家宽 " + brand + ("（移动网络）" if op_hit.get("mobile") else ""))
+elif res_n >= 2 and host_n == 0:
+    bits.append("类型投票为家宽")
+if flag_sources_n == 0:
+    bits.append("无代理标记")
+if cof.get("_dnsbl_ok") and cof.get("_dnsbl_pbl") and not cof.get("_dnsbl_hits"):
+    bits.append("黑名单仅 PBL")
+elif cof.get("_dnsbl_ok") and not cof.get("_dnsbl_hits"):
+    bits.append("黑名单未列")
+
+if code == 0:
+    suggestion = "留：" + ("、".join(bits) if bits else "类型与标志均通过")
+elif code == 3:
+    if host_n > res_n and host_n >= 2:
+        suggestion = "换：多数源判机房"
+    elif flag_sources_n >= 2:
+        suggestion = "换：多源代理/VPN/Tor 阳性"
+    elif sc["ok"] and sc.get("_score") is not None and sc["_score"] > 25:
+        suggestion = "换：Scamalytics Fraud Score %d > 25" % sc["_score"]
+    else:
+        suggestion = "换：" + (reject[0] if reject else "达到放弃线")
+else:
+    if review_reason == "source_failure":
+        suggestion = "待复核：检测源失败（%s），类型与标志本身偏向留；源恢复后可重测" % "、".join(s["title"] for s in failed)
+    elif review_reason == "mixed":
+        suggestion = "待复核：源失败且存在需确认的信号，不建议直接留"
+    else:
+        suggestion = "待复核：" + (other_reviews[0] if other_reviews else (review[0] if review else "需要人工确认"))
+
+print()
+print("======== 情况分析 ========")
+print("结论: %s" % conclusion)
+if why_review:
+    print("原因: %s" % why_review)
+print("综合分: %d / 100" % score_total)
+print("  %-16s %4s  %s" % ("项目", "得分", "说明"))
+for name, got, mx, detail in breakdown:
+    if name == "AbuseIPDB" and p_ab is None:
+        print("  %-16s %4s  %s" % (name, "—", detail))
+    elif name == "AbuseIPDB":
+        print("  %-16s %+4d  %s" % (name, got, detail))
+    else:
+        print("  %-16s %2d/%-2d  %s" % (name, got, mx, detail))
+print("优点:")
+if pros:
+    for x in pros:
+        print("  - " + x)
+else:
+    print("  （无）")
+print("风险:")
+if cons:
+    for x in cons:
+        print("  - " + x)
+else:
+    print("  （无）")
+print("建议: %s" % suggestion)
+print("==========================")
+
+# 机器可读摘要（不含任何密钥）
+asn_val = None
+for s in sources.values():
+    if s.get("ok") and s.get("asns"):
+        asn_val = s["asns"][0]
+        break
+org_val = pick_first(*[x for s in sources.values() if s.get("ok") for x in (s.get("org_texts") or [])])
+city_val = pick_first(*[s.get("city") for s in sources.values() if s.get("ok")])
+country_val = pick_first(*[s.get("country") for s in sources.values() if s.get("ok")])
+rdns_val = pick_first(*hostnames)
+native_label = "broadcast" if p_nat == 0 else ("native" if p_nat == 5 else "unknown")
+scam_score = sources["scamalytics"].get("_score") if sources["scamalytics"]["ok"] else None
+
+summary = {
+    "ip": IP,
+    "timestamp": meta.get("timestamp") or "",
+    "verdict": {0: "pass", 1: "review", 3: "reject"}.get(code, "review"),
+    "verdict_zh": conclusion,
+    "exit_code": code,
+    "score": score_total,
+    "breakdown": [
+        {"item": name, "points": got, "max": mx, "detail": detail}
+        for name, got, mx, detail in breakdown
+    ],
+    "operator": (op_hit or {}).get("brand") if op_hit else None,
+    "operator_kind": (op_hit or {}).get("kind") if op_hit else None,
+    "operator_bonus": bool(bonus_applied),
+    "operator_mobile": bool((op_hit or {}).get("mobile")) if op_hit else False,
+    "asn": asn_val,
+    "org": org_val,
+    "city": city_val,
+    "country": country_val,
+    "rdns": rdns_val,
+    "type_votes": {
+        "residential": res_n,
+        "hosting": host_n,
+        "effective_residential": res_eff,
+        "bonus_applied": bool(bonus_applied),
+    },
+    "flags": [{"source": t, "flags": f} for t, f in flag_voters],
+    "failed_sources": [s["title"] for s in failed],
+    "review_reason": review_reason,
+    "scamalytics_score": scam_score,
+    "native": native_label,
+    "dnsbl_hits": list(cof.get("_dnsbl_hits") or []),
+    "dnsbl_pbl": list(cof.get("_dnsbl_pbl") or []),
+    "suggestion": suggestion,
+    "notes": notes[:],
+    "pros": pros,
+    "cons": cons,
+}
+
+json_path = meta.get("json_path") or ""
+if json_path:
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.chmod(json_path, 0o600)
+        print("JSON: %s" % json_path)
+    except OSError as e:
+        print("JSON 写入失败: %s" % e)
 
 # 给 bash 的退出码文件（不依赖管道）
 with open(os.path.join(WORKDIR, "exit_code"), "w", encoding="utf-8") as f:

@@ -3,7 +3,7 @@ name: vps-node
 description: Pre-flight a freshly bought VPS (hardware / IP reputation / return route, nothing installed) and only then provision a production-ready proxy node — sing-box (VLESS+REALITY :443 + Hysteria2 :8443), BBR tuning, DuckDNS + Let's Encrypt HTTPS subscription endpoint, security hardening (ufw/SSH/sysctl/fail2ban), and a 9-source external IP reputation audit. Use when the user buys a new VPS, wants to set up a 节点/机场/梯子, replace a residential proxy node, or asks to harden + audit a VPS.
 description_zh: "新 VPS 上线全流程：先验货（硬件/IP 质量/回程，不装机）→ sing-box 双协议节点 + BBR + 免费域名 HTTPS 订阅 + 安全加固 + IP 风险体检 → 验收 → 服务端哨兵"
 description_en: "One-shot VPS node deployment: sing-box dual protocol, BBR, HTTPS subscription via DuckDNS+LE, hardening, IP reputation audit"
-version: 1.11.0
+version: 1.12.0
 allowed-tools: Read,Write,Edit,Bash
 display_name: "VPS 节点上线"
 visibility: "public"
@@ -438,7 +438,28 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 | AbuseIPDB（可选，需免费 key） | score < 25 且 90 天举报 < 5 | score ≥ 25 或 90 天举报 ≥ 5 | score ≥ 75 |
 | IPQS（仅全量 `ip-audit.sh`） | 0–10 | 11–75 | > 75（「可疑」档） |
 
-`ip-check-lite.sh` 退出码：0 = 通过，可继续下一步；1 = 需人工复核；3 = 放弃；2 = 参数错误。任一启用源超时、被拦、解析失败，都至少判复核（fail-closed）。过了快查再花钱/花时间跑全量。
+`ip-check-lite.sh` 退出码：0 = 通过（**留**）；1 = 需人工复核（**待复核**）；3 = 放弃（**换**）；2 = 参数错误。任一启用源超时、被拦、解析失败，都至少判复核（fail-closed）。过了快查再花钱/花时间跑全量。
+
+每次快查结束会打印「情况分析」：结论（留 / 换 / 待复核）、0–100 综合分（类型投票、主流运营商加分、代理标志、Scamalytics、原生/广播、DNSBL、rDNS、源完整性；AbuseIPDB 有结果时再加减），以及优点、风险和一句建议。待复核会写明是因为检测源失败，还是 IP 本身有需要确认的信号。机器可读摘要写在 `~/.vps-node/ipaudits/<IP>/lite-<stamp>.json`（权限 600），不含密钥。
+
+测了多条 IP 之后，用 `ip-compare.sh` 做整体比较，看哪条更值得留：
+
+```bash
+# 分 5 次各测一条（每次都会给出该 IP 的留 / 换 / 待复核）
+bash scripts/ip-check-lite.sh <IP1>
+bash scripts/ip-check-lite.sh <IP2>
+bash scripts/ip-check-lite.sh <IP3>
+bash scripts/ip-check-lite.sh <IP4>
+bash scripts/ip-check-lite.sh <IP5>
+
+# 汇总比较：按结论和综合分排序，给出该留哪条、该换哪条
+bash scripts/ip-compare.sh <IP1> <IP2> <IP3> <IP4> <IP5>
+
+# 也可以：--all 比较目录里全部已测 IP；--rerun 先重跑再比；--mask 把 IP 打成 a.b.*.* 方便外传
+# 报告同时写到 ~/.vps-node/ipaudits/compare-<stamp>.md
+```
+
+比较时「留」排在「待复核」和「换」前面，同分再看综合分、是否有主流运营商加分、代理标记更少、测试更新。结果超过 7 天会提示建议 `--rerun`；若第一名仍是待复核且原因只是源失败，报告会单独说明，避免误判成 IP 本身更差。
 
 **可选 AbuseIPDB key**：官网注册免费 key（约 1000 次/天）。不要把 key 写进仓库或命令行。
 
@@ -511,6 +532,10 @@ bash scripts/vps-external-ip-check.sh <IP> 443
 # ---- IP 体检三阶段（详见「IP 体检」一节）----
 # 购买前：裸 IP 快查（ipinfo / IPLogs / Scamalytics / coffee / ipx.al / iping，可选 AbuseIPDB）
 bash scripts/ip-check-lite.sh <IP>
+# 比较多次快查结果，看哪条更值得留
+bash scripts/ip-compare.sh <IP1> <IP2> <IP3>
+bash scripts/ip-compare.sh --all
+bash scripts/ip-compare.sh --mask --rerun <IP1> <IP2>
 # 购买后·情况一：有代理凭据，经 VPS 转发跑全六节（凭据走 stdin，不进命令行；--expect 必填）
 bash scripts/ip-audit.sh --proxy 'socks5h://user:pass@host:port' --expect <IP> --node <凭据别名>
 # 购买后·情况二：纯 VPS，直接上去跑
