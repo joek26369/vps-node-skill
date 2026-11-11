@@ -2,15 +2,21 @@
 # ============================================================================
 # VPS 安全加固（P0-P4）
 # P0 ufw 防火墙 / P1 系统补丁 / P2 SSH 收敛 / P3 sysctl 网络加固 / P4 fail2ban
-# 用法: SSH_PORT=22 WHITELIST_IP=192.0.2.10 bash vps-harden.sh [--no-upgrade]
-# 特性: 幂等；防火墙先放行 SSH 再启用（防自锁）；每步有校验输出
+# 用法: SSH_PORT=<sshd 实际端口> WHITELIST_IP=192.0.2.10 bash vps-harden.sh [--no-upgrade] [--reset-ufw]
+#   --reset-ufw  清空现有 ufw 规则再重建（默认不清空，只在现有规则上追加；清空前总会先备份）
+# 特性: 幂等；先核对 sshd 实际监听端口，不一致拒绝动防火墙（防自锁）；每步有校验输出
 # ============================================================================
 set -uo pipefail
 SSH_PORT="${SSH_PORT:-22}"
 WHITELIST_IP="${WHITELIST_IP:-}"      # 可选：你的家宽出口 IP，加入 fail2ban 白名单
 SUB_PORT="${SUB_PORT:-2096}"          # 订阅端点端口
-DO_UPGRADE=1
-for a in "$@"; do [ "$a" = "--no-upgrade" ] && DO_UPGRADE=0; done
+DO_UPGRADE=1; RESET_UFW=0
+for a in "$@"; do
+  case "$a" in
+    --no-upgrade) DO_UPGRADE=0 ;;
+    --reset-ufw)  RESET_UFW=1 ;;
+  esac
+done
 
 ok(){ echo "  ✅ $*"; }
 warn(){ echo "  ⚠️  $*"; }
@@ -31,7 +37,32 @@ echo "  SSH 端口: $SSH_PORT  订阅单元: $SUBUNIT"
 
 # ---------------------------------------------------------------- P0 防火墙
 hdr "P0. ufw 防火墙（放行 $SSH_PORT/tcp 443/tcp 8443/udp $SUB_PORT/tcp）"
-ufw --force reset >/dev/null 2>&1
+# 防锁死：SSH_PORT 必须是 sshd 实际配置且正在监听的端口，否则一条规则都不动
+case "$SSH_PORT" in ''|*[!0-9]*) warn "SSH_PORT=$SSH_PORT 不是数字"; exit 1 ;; esac
+REAL_PORTS=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -u | tr '\n' ' ')
+if [ -z "$REAL_PORTS" ]; then
+  warn "读不到 sshd -T 的端口，拒绝启用防火墙（防锁死）"; exit 1
+fi
+if ! printf '%s\n' $REAL_PORTS | grep -qx "$SSH_PORT"; then
+  warn "SSH_PORT=$SSH_PORT 与 sshd 实际端口 [ ${REAL_PORTS}] 不一致，拒绝启用防火墙（防锁死）"; exit 1
+fi
+if ! ss -Htln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${SSH_PORT}\$"; then
+  warn "sshd 未在 $SSH_PORT 上监听，拒绝启用防火墙（防锁死）"; exit 1
+fi
+ok "sshd 实际端口: ${REAL_PORTS}"
+# 现有规则先备份；默认不清空（已有 VPS 上可能有你自己的规则），--reset-ufw 才重置
+UFW_BAK="/root/ufw-backup-$(date +%Y%m%d-%H%M%S)"
+if mkdir -p "$UFW_BAK" 2>/dev/null && chmod 700 "$UFW_BAK"; then
+  cp -a /etc/ufw/user.rules /etc/ufw/user6.rules "$UFW_BAK"/ 2>/dev/null || true
+  ufw status numbered > "$UFW_BAK/status.txt" 2>/dev/null || true
+  echo "  现有规则已备份: $UFW_BAK"
+else
+  warn "无法创建备份目录 $UFW_BAK"
+  [ "$RESET_UFW" = "1" ] && { warn "备份失败，拒绝 --reset-ufw"; exit 1; }
+fi
+if [ "$RESET_UFW" = "1" ]; then
+  ufw --force reset >/dev/null 2>&1 && ok "已按 --reset-ufw 清空旧规则"
+fi
 ufw default deny incoming  >/dev/null
 ufw default allow outgoing >/dev/null
 # 先放行 SSH（limit：30 秒内超 6 次新连接即封禁）
@@ -39,7 +70,7 @@ ufw limit "$SSH_PORT/tcp" comment 'SSH (rate-limited)' >/dev/null
 ufw allow 443/tcp            comment 'VLESS+REALITY'   >/dev/null
 ufw allow 8443/udp           comment 'Hysteria2'       >/dev/null
 ufw allow "$SUB_PORT/tcp"    comment 'sub endpoint'    >/dev/null
-if ufw show added | grep -q "$SSH_PORT/tcp"; then
+if ufw show added | grep -qE "(^|[[:space:]])${SSH_PORT}/tcp([[:space:]]|$)"; then
   ufw --force enable >/dev/null && ok "ufw 已启用"
 else
   warn "SSH 规则缺失，拒绝启用防火墙（防锁死）"; exit 1
