@@ -14,3 +14,5 @@ creds.json
 *.key
 id_ed25519*
 id_rsa*
+.github/sensitive-blocklist.local.txt
+._*

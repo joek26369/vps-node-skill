@@ -68,6 +68,28 @@ bash scripts/vps-automation-spec.sh <凭据别名> --json
 
 凭据统一落在 `~/.vps-node/<别名>.json`（权限 600），后续所有脚本都从这里读参数——**换机器只需换这个文件**。 字段模板见 `references/creds.example.json`（全是占位符，不要把真实凭据放进仓库）。
 
+## 仓库自检（提交前跑一次）
+
+```bash
+bash scripts/repo-lint.sh          # 语法 + 敏感值，退出码 0 才算干净
+bash scripts/repo-lint.sh --verbose # 顺带打印每条被放行的匹配，便于复核
+```
+
+三项检查：
+
+1. `bash -n` 全部 shell 脚本（macOS 自带 bash 3.2 也过）
+2. `ast.parse` 全部 python 脚本（不落 `__pycache__`）
+3. 敏感值扫描：公网 IPv4、`/Users/` `/home/` 绝对路径、邮箱；文档示例与 UA 里的版本号自动放行
+
+推上去之后 GitHub Actions（`.github/workflows/lint.yml`）会跑同一套逻辑，外加可执行位检查。CI 只跑通用规则，**你自己环境特有的值**（服务器别名、SSH 端口、订阅服务名）要靠本地黑名单兜底：
+
+```bash
+cp .github/sensitive-blocklist.local.txt.example .github/sensitive-blocklist.local.txt
+# 一行一个词，填完再跑 repo-lint.sh
+```
+
+该文件已在 `.gitignore` 里，不会进仓库。
+
 ## 设计要点
 
 - **验货在设计上只读**：`vps-precheck.sh` 不写远端文件、不装软件，退出码 `0`（合格）/ `1`（有警告）/ `2`（不合格）

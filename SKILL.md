@@ -3,7 +3,7 @@ name: vps-node
 description: Pre-flight a freshly bought VPS (hardware / IP reputation / return route, nothing installed) and only then provision a production-ready proxy node — sing-box (VLESS+REALITY :443 + Hysteria2 :8443), BBR tuning, DuckDNS + Let's Encrypt HTTPS subscription endpoint, security hardening (ufw/SSH/sysctl/fail2ban), and a 9-source external IP reputation audit. Use when the user buys a new VPS, wants to set up a 节点/机场/梯子, replace a residential proxy node, or asks to harden + audit a VPS.
 description_zh: "新 VPS 上线全流程：先验货（硬件/IP 质量/回程，不装机）→ sing-box 双协议节点 + BBR + 免费域名 HTTPS 订阅 + 安全加固 + IP 风险体检 → 验收 → 服务端哨兵"
 description_en: "One-shot VPS node deployment: sing-box dual protocol, BBR, HTTPS subscription via DuckDNS+LE, hardening, IP reputation audit"
-version: 1.8.0
+version: 1.10.0
 allowed-tools: Read,Write,Edit,Bash
 display_name: "VPS 节点上线"
 visibility: "private"
@@ -395,7 +395,38 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 
 **回滚**：还原 `/etc/sing-box/config.json.bak-before-webshare` 并重启；或删掉 `webshare-us` 出站、`route.final` 改回 `direct`、删掉 UDP 规则。凭据里的 `egress_ip` 字段同步删掉。
 
-## 故障排查
+## IP 体检（购买前 / 购买后）
+
+原理一句话：报告测的是「**测试服务器实际看到的出口 IP**」，所以只要让流量从目标 IP 出去就行，不需要先把它配置到机器上。据此分三种入口。
+
+| 时机 | 你手上有什么 | 用什么 | 能测到 |
+|---|---|---|---|
+| **购买前** | 只有一个**裸 IP**（试用、别人给的、还没买） | `ip-check-lite.sh <IP>` | 静态项：归属 / IP 类型 / 风险评分 / 风险因子（免注册三源：ipinfo + IPLogs + Scamalytics） |
+| **购买后·情况一** | **代理型 IP**：有 socks5/http 凭据，IP 未配进任何机器 | `ip-audit.sh --proxy 'socks5h://user:pass@host:port' --expect <IP> [--node <别名>]` | 全六节（含流媒体/AI 解锁、423 库黑名单、IPQS） |
+| **购买后·情况二** | **纯 VPS**：有 SSH | `ip-audit.sh --vps-ip <IP> --vps-port <端口>` | 全六节 |
+| 已配进本 skill 的出站 | 凭据别名 + egress 名 | `ip-audit.sh --node <别名> --egress us1` | 全六节（凭据从 VPS 侧解析，不落本地明文） |
+
+**为什么购买前只能查静态项**：第五、六节要真实向 TikTok / Netflix / ChatGPT / 25 端口发起探测，没有可用的出口 IP 就没有观测点，这不是脚本限制，是物理限制。
+
+### 判定阈值（沿用挑 Webshare IP 时定的标准）
+
+| 指标 | 通过 | 复核 | 放弃 |
+|---|---|---|---|
+| Scamalytics Fraud Score | ≤ 10 | 11–25 | > 25 |
+| IPLogs verdict | `clean` | — | 其它值 |
+| IPQS | 0–10 | 11–75 | > 75（「可疑」档） |
+| 代理 / VPN / Tor / 滥用 / 机器人 | 全部「否/无」 | 单一库阳性可接受 | 多库同时阳性 |
+| IP 类型 | 多数库判「家宽」 | 一半对一半 | 多数判「机房」 |
+
+`ip-check-lite.sh` 退出码 0 = 可继续下一步，1 = 需要人工复核。过了快查再花钱/花时间跑全量。
+
+### 三条硬规矩
+
+- **DNSBL 必须跑在 VPS 上**：本机走 Clash TUN 的 fake-ip（198.18.x），DNSBL 查出来全是无效结果。所以 `--proxy` 模式默认经 VPS 转发执行，`--local` 只作应急
+- **`--expect` 不要省**：同一商家多条 IP 时极易搞混（实测出现过两条 IP 只差最后一位、端口还不同的情况），出口 echo 不等于期望值就中止，避免把 A 的报告当成 B 的
+- **报告公开且不可撤回**：`Report.Check.Place` 只露掩码 IP / ASN / 评分，不含完整 IP，但没有删除接口。本地留档在 `~/.vps-node/ipaudits/<出口IP>/`
+
+
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
@@ -442,6 +473,16 @@ scp scripts/vps-harden.sh root@IP:/root/ && ssh root@IP 'SSH_PORT=22 bash /root/
 # 只做 IP 体检
 bash scripts/vps-external-ip-check.sh <IP> 443
 
+# ---- IP 体检三阶段（详见「IP 体检」一节）----
+# 购买前：只有裸 IP，免注册三源快查
+bash scripts/ip-check-lite.sh <IP>
+# 购买后·情况一：有代理凭据，经 VPS 转发跑全六节（凭据自动转义）
+bash scripts/ip-audit.sh --proxy 'socks5h://user:pass@host:port' --expect <IP> --node <凭据别名>
+# 购买后·情况二：纯 VPS，直接上去跑
+bash scripts/ip-audit.sh --vps-ip <IP> --vps-port 22
+# 已配进本 skill 出站：按 egress 名复测（凭据从 VPS 侧取）
+bash scripts/ip-audit.sh --node <凭据别名> --egress us1
+
 # 深度质量报告
 bash scripts/vps-quality-report.sh <IP> <SSH_PORT> --lowdata
 
@@ -462,12 +503,15 @@ bash scripts/vps-automation-spec.sh <凭据别名> --json     # 机读
 # 周检手动跑一次（等价于 weekly automation 做的事）
 bash scripts/vps-quality-report.sh <IP> <SSH_PORT> --lowdata && \
 bash scripts/vps-quality-diff.sh <凭据别名>
+
+# 改完脚本准备提交前：语法 + 敏感值自检（退出码 0 才算干净）
+bash scripts/repo-lint.sh
 ```
 
 ## 已知限制
 
 - **预检会装 `nexttrace`**：看回程 AS 路径必须有它（mtr 对无 PTR 的跳显示 `AS???`，会把 AS10099 / AS9929 吞掉造成误判）。装不上则退 mtr 并在结论里注明工具名
-- **预检不查 Scamalytics / AbuseIPDB**：这两家要浏览器渲染解析，只在部署后的 `vps-external-ip-check.sh` 里做。预检用 ip-api + proxycheck 两个免费 API 快速判
+- **预检不查 Scamalytics / AbuseIPDB**：这两家要浏览器渲染解析，只在部署后的 `vps-external-ip-check.sh` 里做。预检用 ip-api + proxycheck 两个免费 API 快速判。更新：`ip-check-lite.sh` 已能直接抓 Scamalytics 页面（无需浏览器），但 **AbuseIPDB 免注册页对脚本返回 403**（Cloudflare 挡 curl），只能浏览器手查或注册免费 key（约 5000 次/月）后接进脚本
 - **预检判 FAIL 可用 `FORCE=1` 强推**：比如你明知道是 OpenVZ 但仍要装（BBR 用不了）、或 443 被自己另一个服务占着。强推时警告照样打印
 - **Hysteria2 的 UDP 8443 无法自动验证**，只能靠实际连通判断
 - 体检里的 ipinfo / Scamalytics / AbuseIPDB 依赖本机 Clash 代理 + Chrome headless；代理端口自动探测（7897/7890/7891/1087），可用 `IPCHECK_PROXY=` 覆盖

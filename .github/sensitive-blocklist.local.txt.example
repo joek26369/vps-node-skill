@@ -1,0 +1,18 @@
+# 私有敏感词黑名单（模板）
+#
+# 用法：
+#   1. 复制为 .github/sensitive-blocklist.local.txt（该文件已被 .gitignore 忽略）
+#   2. 一行一个词，只写你自己环境里不能公开的值
+#   3. 运行 bash scripts/repo-lint.sh，本地会逐个全文搜索
+#
+# 为什么需要这一层：
+#   CI 只能跑通用规则（公网 IPv4 / 家目录绝对路径 / 邮箱），
+#   而「服务器别名」「SSH 端口」「订阅服务名」这类值没有通用特征，
+#   必须靠本地黑名单兜底。CI 上该文件不存在，自动跳过。
+#
+# 示例（把下面的换成你自己的，然后删掉行首的 #）：
+# my-server-alias
+# 57xxx
+# my-sub-service
+# my-webhook-domain.example
+

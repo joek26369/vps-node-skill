@@ -1,0 +1,34 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 语法检查 + 敏感值扫描
+        run: bash scripts/repo-lint.sh
+
+      - name: 可执行位检查
+        run: |
+          bad=0
+          while IFS= read -r f; do
+            case "$f" in
+              *.sh)
+                if [ ! -x "$f" ]; then
+                  echo "缺少可执行位：$f"
+                  bad=1
+                fi
+                ;;
+            esac
+          done < <(git ls-files)
+          exit $bad
