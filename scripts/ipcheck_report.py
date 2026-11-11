@@ -161,7 +161,8 @@ def classify_type(label):
         "residential": "家宽", "resi": "家宽", "cable": "家宽", "fttx": "家宽", "dsl": "家宽",
         "mobile": "手机", "mobile isp": "手机", "wireless": "手机", "cell": "手机", "mob": "手机",
         "hosting": "机房", "datacenter": "机房", "data center": "机房", "data centre": "机房",
-        "dch": "机房", "idc": "机房", "server": "机房", "cloud": "机房",
+        "dch": "机房", "idc": "机房", "server": "机房", "cloud": "机房", "host": "机房",
+        "机房": "机房", "家宽": "家宽", "商业": "商业", "手机": "手机",
         "cdn": "CDN", "content delivery network": "CDN",
         "business": "商业", "commercial": "商业", "com": "商业", "company": "商业",
         "education": "教育", "edu": "教育", "university/college/school": "教育",
@@ -180,26 +181,37 @@ def classify_type(label):
     return s
 
 
+def _manual_tag(text):
+    s = "" if text is None else str(text)
+    if "（手动）" in s:
+        return s.replace("（手动）", ""), "（手动）"
+    return s, ""
+
+
 def color_type(text, c):
-    if text in ("家宽", "手机"):
-        return c.bg_green + " " + text + " " + c.reset
-    if text in ("机房", "CDN", "蜘蛛"):
-        return c.bg_red + " " + text + " " + c.reset
-    if text not in ("—", "未配置", None, ""):
-        return c.bg_yellow + " " + text + " " + c.reset
-    return text or "—"
+    base, tag = _manual_tag(text)
+    if base in ("家宽", "手机"):
+        return c.bg_green + " " + base + " " + c.reset + tag
+    if base in ("机房", "CDN", "蜘蛛"):
+        return c.bg_red + " " + base + " " + c.reset + tag
+    if base not in ("—", "未配置", None, "") and "不可用" not in base:
+        return c.bg_yellow + " " + base + " " + c.reset + tag
+    return (text or "—")
 
 
 def color_bool(text, c):
-    if text == "是":
-        return c.red + c.bold + "是" + c.reset
-    if text == "否":
-        return c.green + c.bold + "否" + c.reset
+    base, tag = _manual_tag(text)
+    if base == "是":
+        return c.red + c.bold + "是" + c.reset + tag
+    if base == "否":
+        return c.green + c.bold + "否" + c.reset + tag
     return text
 
 
 def color_level(level, c):
     if not level or level in ("—", "未配置"):
+        return level
+    if "不可用" in str(level):
         return level
     if any(k in level for k in ("极高", "高风险", "建议封禁", "存在风险")):
         return c.red + c.bold + level + c.reset
@@ -265,7 +277,17 @@ def ipqs_level(score):
 def dbip_level(text):
     if not text:
         return None
-    return {"low": "低风险", "medium": "中风险", "high": "高风险"}.get(str(text).strip().lower())
+    s = str(text).strip().lower()
+    mapping = {
+        "low": "低风险", "medium": "中风险", "high": "高风险",
+        "低": "低风险", "中": "中风险", "高": "高风险",
+        "低风险": "低风险", "中风险": "中风险", "高风险": "高风险",
+    }
+    if s in mapping:
+        return mapping[s]
+    # 截掉「风险」再试（「低风险」已在 mapping；「低」也在）
+    s2 = s.replace("风险", "").strip()
+    return mapping.get(s2)
 
 
 def read_json_body(workdir, name):
@@ -1460,7 +1482,7 @@ def _row_type(db, usage, company, status, note=None):
     return {"db": db, "usage": usage or "—", "company": company or "—", "status": status, "note": note}
 
 
-def build_types(sources, extras, key_status):
+def build_types(sources, extras, key_status, manual_db=None):
     rows = []
     if key_status.get("ipinfo_paid"):
         d = (extras.get("ipinfo_full") or {}).get("data") or {}
@@ -1517,10 +1539,10 @@ def build_types(sources, extras, key_status):
     if _src_ok(sources, "iping"):
         zh = {"res": "家宽", "host": "机房"}.get(sources["iping"].get("type_vote"), "—")
         rows.append(_row_type("iping.cc", zh, "—", "ok"))
-    return rows
+    return apply_manual_types(rows, manual_db)
 
 
-def build_scores(sources, extras, key_status):
+def build_scores(sources, extras, key_status, manual_db=None):
     rows = []
     i2 = (extras.get("ip2location") or {}).get("data") or {}
     if i2 and i2.get("fraud_score") is not None:
@@ -1556,10 +1578,18 @@ def build_scores(sources, extras, key_status):
         rows.append({"db": "AbuseIPDB", "score": sc, "level": abuse_level(sc) or "—", "status": "ok"})
     else:
         rows.append({"db": "AbuseIPDB", "score": None, "level": "未配置", "status": "no_key"})
-    if key_status.get("ipqs"):
-        d = (extras.get("ipqs") or {}).get("data") or {}
+    ipqs_ex = extras.get("ipqs") or {}
+    insp = inspect_ipqs(ipqs_ex.get("data"), ipqs_ex.get("http")) if key_status.get("ipqs") else None
+    if insp and insp.get("ok"):
+        d = ipqs_ex.get("data") or {}
         sc = d.get("fraud_score")
         rows.append({"db": "IPQS", "score": sc, "level": ipqs_level(sc) or "—", "status": "ok"})
+    elif insp and insp.get("status") == "no_credits":
+        rows.append({"db": "IPQS", "score": None, "level": "不可用（额度不足）", "status": "no_credits",
+                     "note": "接口已配置但额度不足，不计入分数、不视为失败"})
+    elif key_status.get("ipqs"):
+        reason = (insp or {}).get("reason") or "不可用"
+        rows.append({"db": "IPQS", "score": None, "level": reason, "status": (insp or {}).get("status") or "fail"})
     else:
         rows.append({"db": "IPQS", "score": None, "level": "未配置", "status": "no_key"})
     d = (extras.get("dbip") or {}).get("data") or {}
@@ -1567,7 +1597,7 @@ def build_scores(sources, extras, key_status):
         rows.append({"db": "DB-IP", "score": d.get("threatLevel"), "level": dbip_level(d.get("threatLevel")) or "—", "status": "ok"})
     else:
         rows.append({"db": "DB-IP", "score": None, "level": "未配置", "status": "no_key", "note": "免费层无 threatLevel"})
-    return rows
+    return apply_manual_scores(rows, manual_db, extras)
 
 def _factor(db, region=None, proxy=None, tor=None, vpn=None, server=None, abuser=None, robot=None, independent=True, note=None, status="ok"):
     unset = "未配置" if status == "no_key" else ("—" if status != "ok" else None)
@@ -1591,7 +1621,7 @@ def _cc(v):
     return s.upper() if len(s) == 2 else s
 
 
-def build_factors(sources, extras, key_status):
+def build_factors(sources, extras, key_status, manual_db=None):
     rows = []
     i2 = (extras.get("ip2location") or {}).get("data") or {}
     if i2 and (i2.get("is_proxy") is not None or i2.get("proxy") or i2.get("usage_type")):
@@ -1625,10 +1655,17 @@ def build_factors(sources, extras, key_status):
             server=sec.get("is_cloud_provider"), abuser=sec.get("is_abuser"), independent=True))
     else:
         rows.append(_factor("ipregistry", status="no_key", independent=False))
-    if key_status.get("ipqs"):
-        d = (extras.get("ipqs") or {}).get("data") or {}
+    ipqs_ex = extras.get("ipqs") or {}
+    insp = inspect_ipqs(ipqs_ex.get("data"), ipqs_ex.get("http")) if key_status.get("ipqs") else None
+    if insp and insp.get("ok"):
+        d = ipqs_ex.get("data") or {}
         rows.append(_factor("IPQS", region=d.get("country_code"), proxy=d.get("proxy"),
             tor=d.get("tor"), vpn=d.get("vpn"), abuser=d.get("recent_abuse"), robot=d.get("bot_status"), independent=True))
+    elif insp and insp.get("status") == "no_credits":
+        rows.append(_factor("IPQS", status="no_credits", independent=False, note="不可用（额度不足）"))
+    elif key_status.get("ipqs"):
+        rows.append(_factor("IPQS", status="fail", independent=False,
+                            note=(insp or {}).get("reason") or "不可用"))
     else:
         rows.append(_factor("IPQS", status="no_key", independent=False))
     if _src_ok(sources, "scamalytics"):
@@ -1690,7 +1727,7 @@ def build_factors(sources, extras, key_status):
         flags = s.get("flags") or []
         rows.append(_factor("iping.cc", region=s.get("country"),
             proxy="proxy" in flags, server=(s.get("type_vote") == "host"), independent=True))
-    return rows
+    return apply_manual_factors(rows, manual_db)
 
 
 def empty_unlock():
@@ -1774,15 +1811,29 @@ def build_report(ctx):
     basic = build_basic(sources, extras, meta)
     hard = ctx.get("hard") or ctx.get("hard_evidence") or {}
     basic.update(_format_hard_basic(hard))
-    return {
+    notes = ctx.get("notes") or ctx.get("manual_notes") or {}
+    db = notes.get("db") if isinstance(notes, dict) and "db" in notes else (ctx.get("manual_db") or {})
+    types = build_types(sources, extras, key_status, manual_db=db)
+    scores = build_scores(sources, extras, key_status, manual_db=db)
+    factors = build_factors(sources, extras, key_status, manual_db=db)
+    mail = build_mail(ctx.get("mode") or "bare", ctx.get("local25"), ctx.get("remote25"), ctx.get("dnsbl"))
+    mail = apply_manual_mail(mail, db)
+    out = {
         "basic": basic,
-        "types": build_types(sources, extras, key_status),
-        "scores": build_scores(sources, extras, key_status),
-        "factors": build_factors(sources, extras, key_status),
+        "types": types,
+        "scores": scores,
+        "factors": factors,
         "unlock": ctx.get("unlock") or empty_unlock(),
-        "mail": build_mail(ctx.get("mode") or "bare", ctx.get("local25"), ctx.get("remote25"), ctx.get("dnsbl")),
+        "mail": mail,
         "hard_evidence": hard,
     }
+    if notes_has_content(notes):
+        out["manual_notes"] = {
+            "updated": notes.get("updated"),
+            "observed": notes.get("observed"),
+            "source": "手动",
+        }
+    return out
 
 
 def print_report(report, color=False):
@@ -1877,6 +1928,14 @@ def print_report(report, color=False):
         print("                   （查询失败或解析器拒绝 %s 家，未计入有效）" % bl["failed"])
     if bl.get("note"):
         print("                   %s" % bl["note"])
+    mn = report.get("manual_notes") or {}
+    if mn:
+        bits = []
+        if mn.get("updated"):
+            bits.append("记录于 %s（America/New_York）" % mn["updated"])
+        if mn.get("observed"):
+            bits.append("观测 %s" % mn["observed"])
+        print("  手动记录：%s" % ("；".join(bits) if bits else "已应用（手动）"))
     print()
 
 
@@ -2052,25 +2111,45 @@ def parse_note_unlock(spec):
                     break
         if not name or not val:
             continue
-        val_l = val.lower().replace(" ", "")
+        region = "—"
         method = "手动"
-        if val_l in ("原生", "native"):
+        raw_v = val.strip()
+        mreg = re.search(r"\[([A-Za-z]{2})\]", raw_v)
+        if mreg:
+            region = mreg.group(1).upper()
+            raw_v = (raw_v[:mreg.start()] + " " + raw_v[mreg.end():]).strip()
+        else:
+            mreg = re.search(r"[:/]([A-Za-z]{2})$", raw_v)
+            if mreg:
+                region = mreg.group(1).upper()
+                raw_v = raw_v[:mreg.start()].strip()
+        # 方式：原生 / DNS 可写在状态前后
+        if re.search(r"(?i)\bDNS\b|DNS", raw_v) and "原生" not in raw_v:
+            if re.search(r"(?i)dns", raw_v):
+                method = "DNS"
+                raw_v = re.sub(r"(?i)DNS", "", raw_v).strip(" /+，,")
+        if "原生" in raw_v or re.search(r"(?i)\bnative\b", raw_v):
+            method = "原生"
+            raw_v = re.sub(r"(?i)原生|native", "", raw_v).strip(" /+，,")
+        val_l = re.sub(r"\s+", "", raw_v).lower()
+        if not val_l and method in ("DNS", "原生"):
+            status = "解锁"
+        elif val_l in ("原生", "native"):
             status, method = "解锁", "原生"
         elif val_l in ("dns",):
             status, method = "解锁", "DNS"
         else:
-            status = NOTE_STATUS_MAP.get(val_l) or NOTE_STATUS_MAP.get(val.strip())
+            status = NOTE_STATUS_MAP.get(val_l) or NOTE_STATUS_MAP.get(raw_v.strip())
             if not status:
-                # 允许 解锁(原生) / 解锁/原生
-                m = re.match(r"^(解锁|屏蔽|仅自制|仅APP|仅网页|失败|未测)(?:[（(/]+(原生|DNS|dns|手动)?", val.strip())
+                m = re.match(r"^(解锁|屏蔽|仅自制|仅APP|仅网页|失败|未测)(?:[（(/]+(原生|DNS|dns|手动)?", raw_v.strip())
                 if m:
                     status = m.group(1)
                     if m.group(2):
-                        method = "DNS" if m.group(2).lower() == "dns" else ("原生" if m.group(2) in ("原生", "native") else "手动")
+                        method = "DNS" if m.group(2).lower() == "dns" else ("原生" if m.group(2) in ("原生", "native") else method)
                 else:
                     continue
         items.append({
-            "name": name, "status": status, "region": "—", "method": method,
+            "name": name, "status": status, "region": region, "method": method,
             "source": "手动",
         })
     # last mention wins
@@ -2110,6 +2189,673 @@ def merge_manual_unlock(unlock, manual_items):
             if "未测（需 --proxy" in reason or not unlock.get("tested"):
                 unlock["reason"] = extra
     return unlock
+
+
+
+def redact_secrets(text):
+    """日志/错误里绝不带出密钥。"""
+    if text is None:
+        return text
+    s = str(text)
+    s = re.sub(r"(ipqualityscore\.com/api/json/ip/)[^/\s\"']+", r"\1***", s, flags=re.I)
+    s = re.sub(r"(api[_-]?key=)[^&\s\"']+", r"\1***", s, flags=re.I)
+    s = re.sub(r"(Authorization:\s*Bearer\s+)\S+", r"\1***", s, flags=re.I)
+    return s
+
+
+def inspect_ipqs(data, http=None):
+    """判定 IPQS 响应是否可用。额度不足不算数据、不导致失败。"""
+    if not data or not isinstance(data, dict):
+        if http and str(http) not in ("", "200", "0"):
+            return {"ok": False, "status": "fail", "reason": "http %s" % http}
+        return {"ok": False, "status": "no_data", "reason": "无数据"}
+    msg = data.get("message") or data.get("error") or data.get("success_message") or ""
+    msg_s = redact_secrets(msg)
+    low = msg_s.lower() if isinstance(msg_s, str) else ""
+    success = data.get("success")
+    credit_hit = any(k in low for k in (
+        "insufficient credit", "insufficient credits", "no credits", "out of credit",
+        "credit limit", "not enough credit", "quota", "额度不足", "余额不足", "没有额度",
+        "0 credits", "zero credits",
+    )) or ("credit" in low and any(w in low for w in ("insufficient", "exceed", "empty", "lack", "no ")))
+    if credit_hit or (success in (False, "false", 0, "0") and "credit" in low):
+        return {"ok": False, "status": "no_credits", "reason": "不可用（额度不足）"}
+    if success in (False, "false", 0, "0"):
+        return {"ok": False, "status": "error", "reason": "不可用"}
+    if data.get("fraud_score") is None and data.get("proxy") is None and data.get("vpn") is None:
+        if success in (True, "true", 1, "1"):
+            return {"ok": False, "status": "no_data", "reason": "无数据"}
+        return {"ok": False, "status": "no_data", "reason": "无数据"}
+    return {"ok": True, "status": "ok", "reason": None}
+
+
+def _note_bool(v):
+    if v is None or v == "":
+        return None
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "是", "真", "t", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "否", "假", "f", "off"):
+        return False
+    return None
+
+
+def _note_num(v):
+    if v is None or v == "":
+        return None
+    s = str(v).strip().rstrip("%％")
+    try:
+        if "." in s:
+            return float(s)
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+
+# 库名别名 → 规范名
+_DB_ALIASES = {
+    "ipqs": "ipqs", "ipquality": "ipqs", "ipqualityscore": "ipqs", "ip-quality": "ipqs",
+    "ip2location": "ip2location", "ip2": "ip2location", "iplocation": "ip2location",
+    "ip2loc": "ip2location",
+    "ipapi": "ipapi", "ipapi.is": "ipapi", "ipapi_is": "ipapi",
+    "ipinfo": "ipinfo", "ipinfo.io": "ipinfo",
+    "ipregistry": "ipregistry",
+    "abuseipdb": "abuseipdb", "abuse": "abuseipdb",
+    "db-ip": "dbip", "dbip": "dbip", "db_ip": "dbip",
+    "scamalytics": "scamalytics", "scam": "scamalytics",
+    "dnsbl": "dnsbl", "blacklist": "dnsbl", "黑名单": "dnsbl",
+    "iplogs": "iplogs",
+    "mail": "mail",
+    "local25": "local25", "remote25": "remote25",
+}
+
+_FIELD_ALIASES = {
+    "type": "type", "usage": "type", "usage_type": "type", "ip_type": "type", "种类": "type",
+    "company": "company", "company_type": "company", "org_type": "company",
+    "server": "server", "is_server": "server",
+    "proxy": "proxy", "is_proxy": "proxy",
+    "vpn": "vpn", "is_vpn": "vpn",
+    "tor": "tor", "is_tor": "tor",
+    "risk": "risk", "score": "score", "fraud": "score", "fraud_score": "score",
+    "listed": "listed", "黑名单": "listed",
+    "marked": "marked", "已标记": "marked", "pbl": "marked",
+    "valid": "valid", "有效": "valid", "total": "valid",
+    "normal": "normal", "clean": "normal", "正常": "normal",
+    "abuser": "abuser", "robot": "robot",
+    "level": "level",
+    "observed": "observed", "date": "observed",
+}
+
+
+def parse_note_db(spec):
+    """解析 --note-db 'ipqs=75,ipqs.proxy=1,...'。空或非法项忽略。"""
+    out = {}
+    if not spec:
+        return out
+    # 允许换行或分号
+    raw = str(spec).replace(";", ",").replace("\n", ",")
+    for part in raw.split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        key, val = part.split("=", 1)
+        key = key.strip().lower()
+        val = val.strip()
+        if not key:
+            continue
+        if key in ("observed", "date", "noted_at"):
+            out.setdefault("_meta", {})["observed"] = val
+            continue
+        if "." in key:
+            db, field = key.split(".", 1)
+        else:
+            db, field = key, None
+        db = _DB_ALIASES.get(db, db)
+        # 无字段：按库默认
+        if field is None:
+            if db in ("local25", "remote25"):
+                out.setdefault("mail", {})[db] = val
+                continue
+            if db == "mail":
+                continue
+            if db == "dnsbl":
+                field = "listed"
+            elif db in ("ipqs", "abuseipdb", "scamalytics"):
+                field = "score"
+            elif db in ("ipapi",):
+                # 裸 ipapi=2.20 当风险分；ipapi=business 当类型
+                if _note_num(val) is not None:
+                    field = "risk"
+                else:
+                    field = "type"
+            elif db == "dbip":
+                field = "level"
+            else:
+                field = "type"
+        field = _FIELD_ALIASES.get(field, field)
+        bucket = out.setdefault(db, {})
+        if field in ("proxy", "vpn", "tor", "server", "abuser", "robot"):
+            b = _note_bool(val)
+            if b is not None:
+                bucket[field] = b
+        elif field in ("score", "listed", "marked", "valid", "normal"):
+            n = _note_num(val)
+            if n is not None:
+                bucket[field] = n
+        elif field == "risk":
+            n = _note_num(val)
+            bucket["risk"] = n if n is not None else val
+            bucket["risk_raw"] = val
+        else:
+            bucket[field] = val
+    return out
+
+
+def notes_path(audit_root, ip):
+    return os.path.join(audit_root, ip, "notes.json")
+
+
+def load_notes(audit_root, ip):
+    path = notes_path(audit_root, ip)
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def merge_notes(saved, db_new, unlock_new, clear=False):
+    """合并持久化手动记录。新键覆盖同名字段；未给出的键保留。clear 先清空再写入本次。"""
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    base = {} if clear or not saved else dict(saved)
+    db = {} if clear else dict(base.get("db") or {})
+    if db_new:
+        for k, v in db_new.items():
+            if k == "_meta":
+                continue
+            if isinstance(v, dict) and isinstance(db.get(k), dict):
+                merged = dict(db[k])
+                merged.update(v)
+                db[k] = merged
+            else:
+                db[k] = v
+        meta = (db_new or {}).get("_meta") or {}
+        if meta.get("observed"):
+            db.setdefault("_meta", {})["observed"] = meta["observed"]
+    unlock = [] if clear else list(base.get("unlock") or [])
+    if unlock_new:
+        by_name = {}
+        for it in unlock:
+            n = (it or {}).get("name")
+            if n:
+                by_name[n] = dict(it)
+        for it in unlock_new:
+            n = (it or {}).get("name")
+            if n:
+                by_name[n] = dict(it)
+                by_name[n]["source"] = "手动"
+        unlock = [by_name[k] for k in by_name]
+    out = {
+        "db": db,
+        "unlock": unlock,
+        "updated": now,
+        "source": "手动",
+    }
+    if (db.get("_meta") or {}).get("observed"):
+        out["observed"] = db["_meta"]["observed"]
+    elif base.get("observed") and not clear:
+        out["observed"] = base["observed"]
+    return out
+
+
+def save_notes(audit_root, ip, notes):
+    if not notes:
+        return None
+    db = notes.get("db") or {}
+    unlock = notes.get("unlock") or []
+    # 空记录不写
+    has_db = any(k != "_meta" for k in db)
+    if not has_db and not unlock:
+        return None
+    d = os.path.join(audit_root, ip)
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    except TypeError:
+        # py3.2 无 exist_ok? 3.2 is old; box has 3.x with exist_ok. fallback:
+        try:
+            os.makedirs(d, mode=0o700)
+        except OSError:
+            pass
+    path = notes_path(audit_root, ip)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(notes, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.rename(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
+def clear_notes_file(audit_root, ip):
+    path = notes_path(audit_root, ip)
+    if os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            return False
+        return True
+    return False
+
+
+def type_vote_of_label(label):
+    zh = classify_type(label) if label not in (None, "") else None
+    if zh in ("机房", "CDN"):
+        return "host", zh
+    if zh in ("家宽", "手机"):
+        return "res", zh
+    return None, zh
+
+
+_DB_VOTE_TITLE = {
+    "ip2location": "IP2Location（手动）",
+    "ipinfo": "IPinfo（手动）",
+    "ipregistry": "ipregistry（手动）",
+    "ipapi": "ipapi（手动）",
+    "abuseipdb": "AbuseIPDB（手动）",
+    "ipqs": "IPQS（手动）",
+    "dbip": "DB-IP（手动）",
+    "scamalytics": "Scamalytics（手动）",
+    "iplogs": "IPLogs（手动）",
+}
+
+
+def manual_type_votes(db):
+    """从手动库产出类型投票。公司类型不单独投票；server=是且无类型时记一票机房。"""
+    votes = []
+    if not db:
+        return votes
+    for key, rec in db.items():
+        if key in ("_meta", "dnsbl", "mail", "local25", "remote25"):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        title = _DB_VOTE_TITLE.get(key, key + "（手动）")
+        typ = rec.get("type")
+        vote, zh = type_vote_of_label(typ) if typ not in (None, "") else (None, None)
+        if vote is None and rec.get("server") is True:
+            vote, zh = "host", "机房"
+        if vote:
+            votes.append((title, vote, "使用类型 %s" % (zh or typ)))
+    return votes
+
+
+def manual_flag_voters(db):
+    """手动代理/VPN/Tor 标志。IPQS 等进入高权重源（标题含 ipqs）。"""
+    out = []
+    if not db:
+        return out
+    for key, rec in db.items():
+        if not isinstance(rec, dict):
+            continue
+        flags = []
+        for name in ("proxy", "vpn", "tor"):
+            if rec.get(name) is True:
+                flags.append(name)
+        if flags:
+            # 标题要让 _flag_kind 识别出高权重源
+            title = {"ipqs": "IPQS", "ipquality": "IPQS", "scamalytics": "Scamalytics",
+                     "ipinfo": "IPinfo", "ipregistry": "ipregistry", "ipdata": "ipdata",
+                     "iplogs": "IPLogs"}.get(key, key)
+            out.append((title, flags))
+    return out
+
+
+def ipqs_score_from(db, extras=None, key_status=None):
+    """优先用可用的实时 IPQS；否则用手动分数。额度不足的实时响应不用。"""
+    insp = None
+    if extras and extras.get("ipqs"):
+        insp = inspect_ipqs(extras["ipqs"].get("data"), extras["ipqs"].get("http"))
+        if insp.get("ok"):
+            d = extras["ipqs"]["data"]
+            try:
+                return int(float(d.get("fraud_score"))), "live"
+            except (TypeError, ValueError):
+                pass
+    rec = (db or {}).get("ipqs") or {}
+    if rec.get("score") is not None:
+        try:
+            return int(float(rec["score"])), "manual"
+        except (TypeError, ValueError):
+            pass
+    return None, (insp.get("status") if insp else None)
+
+
+def ipapi_risk_level(score):
+    try:
+        n = float(score)
+    except (TypeError, ValueError):
+        s = str(score or "")
+        if "高" in s:
+            return "高风险"
+        if "较高" in s or "中" in s:
+            return "较高风险" if "较高" in s else "中风险"
+        if "低" in s:
+            return "低风险"
+        return s or None
+    # 百分数：0.12 低，2.20 较高
+    if n < 1:
+        return "低风险"
+    if n < 2:
+        return "中风险"
+    if n < 5:
+        return "较高风险"
+    return "高风险"
+
+
+def format_risk_display(val):
+    if val is None or val == "":
+        return None
+    try:
+        n = float(val)
+        if abs(n - int(n)) < 1e-9:
+            return str(int(n))
+        # 保留原百分感
+        s = ("%g" % n)
+        return s
+    except (TypeError, ValueError):
+        return str(val)
+
+
+def _tag_manual(text, tagged=True):
+    if text in (None, "", "—"):
+        return text
+    s = str(text)
+    if tagged and "（手动）" not in s:
+        return s + "（手动）"
+    return s
+
+
+def apply_manual_types(rows, db):
+    """把手动类型填进二、表格。未配置/失败的格子用手动值 +（手动）。"""
+    if not db:
+        return rows
+    name_of = {
+        "ipinfo": "IPinfo",
+        "ipregistry": "ipregistry",
+        "ipapi": "ipapi",
+        "ip2location": "IP2Location",
+        "abuseipdb": "AbuseIPDB",
+        "ipqs": "IPQS",
+        "dbip": "DB-IP",
+        "scamalytics": "Scamalytics",
+        "iplogs": "IPLogs",
+    }
+    by = {r.get("db"): r for r in rows}
+    for key, rec in db.items():
+        if key not in name_of or not isinstance(rec, dict):
+            continue
+        dbn = name_of[key]
+        typ = rec.get("type")
+        company = rec.get("company")
+        if typ in (None, "") and company in (None, ""):
+            continue
+        zh_t = classify_type(typ) if typ not in (None, "") else None
+        zh_c = classify_type(company) if company not in (None, "") else None
+        r = by.get(dbn)
+        if r is None:
+            r = _row_type(dbn, _tag_manual(zh_t) if zh_t else "—",
+                          _tag_manual(zh_c) if zh_c else "—",
+                          "manual", "手动记录")
+            rows.append(r)
+            by[dbn] = r
+            continue
+        # 覆盖空/未配置/失败；实时有效数据保留，缺的字段补手动
+        fillable = r.get("status") in ("no_key", "fail", "no_data", "no_credits", "error", "no_field", "limited_free") \
+            or r.get("usage") in (None, "", "—", "未配置")
+        if zh_t and (fillable or r.get("usage") in (None, "", "—", "未配置")):
+            r["usage"] = _tag_manual(zh_t)
+            r["status"] = "manual" if fillable else r.get("status")
+            r["note"] = (r.get("note") or "")
+            if "手动" not in (r.get("note") or ""):
+                r["note"] = ((r["note"] + "；") if r["note"] else "") + "手动记录"
+        elif zh_t and "（手动）" not in str(r.get("usage") or "") and fillable:
+            r["usage"] = _tag_manual(zh_t)
+        if zh_c and (r.get("company") in (None, "", "—", "未配置") or fillable):
+            r["company"] = _tag_manual(zh_c)
+    return rows
+
+
+def apply_manual_scores(rows, db, extras=None):
+    if not db:
+        return rows
+    by = {r.get("db"): r for r in rows}
+
+    def upsert(dbn, score, level, note="手动记录"):
+        r = by.get(dbn)
+        cell_s = _tag_manual(score if score not in (None, "") else "—")
+        cell_l = _tag_manual(level) if level else "—"
+        if r is None:
+            rows.append({"db": dbn, "score": cell_s, "level": cell_l, "status": "manual", "note": note})
+            by[dbn] = rows[-1]
+            return
+        fillable = r.get("status") in ("no_key", "fail", "no_data", "no_credits", "error") \
+            or r.get("score") in (None, "", "—")
+        if fillable:
+            if score not in (None, ""):
+                r["score"] = cell_s
+            if level:
+                r["level"] = cell_l
+            r["status"] = "manual"
+            if "手动" not in (r.get("note") or ""):
+                r["note"] = ((r.get("note") + "；") if r.get("note") else "") + note
+
+    rec = db.get("ipqs") or {}
+    if rec.get("score") is not None:
+        upsert("IPQS", rec["score"], ipqs_level(rec["score"]))
+    rec = db.get("ip2location") or {}
+    if rec.get("risk") is not None:
+        upsert("IP2Location", format_risk_display(rec["risk"]), ip2_level(rec["risk"]))
+    rec = db.get("ipapi") or {}
+    if rec.get("risk") is not None:
+        raw = rec.get("risk_raw") or format_risk_display(rec["risk"])
+        # 展示带 %（若还没有）
+        disp = str(raw)
+        if "%" not in disp and _note_num(raw) is not None:
+            disp = str(raw).rstrip("%") + "%"
+        upsert("ipapi", disp, ipapi_risk_level(rec["risk"]))
+    rec = db.get("abuseipdb") or {}
+    if rec.get("score") is not None:
+        upsert("AbuseIPDB", rec["score"], abuse_level(rec["score"]))
+    rec = db.get("scamalytics") or {}
+    if rec.get("score") is not None:
+        upsert("Scamalytics", rec["score"], scam_level(rec["score"]))
+    rec = db.get("dbip") or {}
+    if rec.get("level") not in (None, "") or rec.get("score") is not None:
+        lv = rec.get("level") or dbip_level(rec.get("score"))
+        upsert("DB-IP", rec.get("score") if rec.get("score") is not None else lv, dbip_level(lv) or lv)
+    return rows
+
+
+def apply_manual_factors(rows, db):
+    if not db:
+        return rows
+    name_of = {
+        "ipinfo": "IPinfo", "ipregistry": "ipregistry", "ipapi": "ipapi",
+        "ip2location": "IP2Location", "abuseipdb": "AbuseIPDB", "ipqs": "IPQS",
+        "scamalytics": "Scamalytics", "dbip": "DB-IP", "iplogs": "IPLogs",
+    }
+    by = {r.get("db"): r for r in rows}
+
+    def zh_cell(v):
+        if v is True:
+            return "是"
+        if v is False:
+            return "否"
+        return None
+
+    for key, rec in db.items():
+        if key not in name_of or not isinstance(rec, dict):
+            continue
+        dbn = name_of[key]
+        r = by.get(dbn)
+        fields = {
+            "proxy": zh_cell(rec["proxy"]) if "proxy" in rec else None,
+            "tor": zh_cell(rec["tor"]) if "tor" in rec else None,
+            "vpn": zh_cell(rec["vpn"]) if "vpn" in rec else None,
+            "server": zh_cell(rec["server"]) if "server" in rec else None,
+            "abuser": zh_cell(rec["abuser"]) if "abuser" in rec else None,
+            "robot": zh_cell(rec["robot"]) if "robot" in rec else None,
+        }
+        if not any(v is not None for v in fields.values()):
+            continue
+        if r is None:
+            r = _factor(dbn,
+                        proxy=_tag_manual(fields["proxy"] or "—"),
+                        tor=_tag_manual(fields["tor"] or "—"),
+                        vpn=_tag_manual(fields["vpn"] or "—"),
+                        server=_tag_manual(fields["server"] or "—"),
+                        abuser=_tag_manual(fields["abuser"]) if fields["abuser"] else None,
+                        robot=_tag_manual(fields["robot"]) if fields["robot"] else None,
+                        independent=True, note="手动记录", status="manual")
+            rows.append(r)
+            by[dbn] = r
+            continue
+        fillable = r.get("status") in ("no_key", "fail", "no_data", "no_credits", "error")
+        for f in ("proxy", "tor", "vpn", "server", "abuser", "robot"):
+            if fields[f] is None:
+                continue
+            cur = r.get(f)
+            if fillable or cur in (None, "", "—", "未配置"):
+                r[f] = _tag_manual(fields[f])
+        if "手动" not in (r.get("note") or ""):
+            r["note"] = ((r.get("note") + "；") if r.get("note") else "") + "手动记录"
+            if fillable:
+                r["status"] = "manual"
+    return rows
+
+
+def notes_has_content(notes):
+    if not notes or not isinstance(notes, dict):
+        return False
+    db = notes.get("db") or {}
+    if any(k != "_meta" for k in db):
+        return True
+    if notes.get("unlock"):
+        return True
+    return False
+
+
+# 手动黑名单有效库过少时视为覆盖不全，不当信号（例如截图只查到 1 家）
+DNSBL_COVERAGE_MIN = 10
+
+
+def dnsbl_coverage_incomplete(rec):
+    if not rec:
+        return False
+    if rec.get("valid") is None:
+        return False
+    try:
+        n = int(rec.get("valid"))
+    except (TypeError, ValueError):
+        return False
+    return 0 < n < DNSBL_COVERAGE_MIN
+
+
+def apply_manual_mail(mail, db):
+    if not db or not mail:
+        return mail
+    rec_mail = db.get("mail") or {}
+    # 也接受顶层 local25/remote25
+    for k in ("local25", "remote25"):
+        val = rec_mail.get(k)
+        if val is None and isinstance(db.get(k), dict):
+            val = None
+        if val is None and k in db and not isinstance(db.get(k), dict):
+            val = db[k]
+        if val not in (None, ""):
+            # 未实测时用手动
+            cur = mail.get(k)
+            if cur in (None, "", "—") or ("未测" in str(cur)) or ("仅 VPS" in str(cur)):
+                mail[k] = _tag_manual(val)
+    rec = db.get("dnsbl") or {}
+    if rec:
+        bl = dict(mail.get("dnsbl") or {})
+        bl["doh"] = {
+            "total_valid": bl.get("total_valid"),
+            "clean": bl.get("clean"),
+            "marked": bl.get("marked"),
+            "listed": bl.get("listed"),
+            "hits": bl.get("hits"),
+            "failed": bl.get("failed"),
+        }
+        if rec.get("valid") is not None:
+            bl["total_valid"] = int(rec["valid"]) if not isinstance(rec["valid"], int) else rec["valid"]
+        if rec.get("normal") is not None:
+            bl["clean"] = rec["normal"]
+        if rec.get("marked") is not None:
+            bl["marked"] = rec["marked"]
+        if rec.get("listed") is not None:
+            bl["listed"] = rec["listed"]
+        incomplete = dnsbl_coverage_incomplete(rec)
+        bl["source"] = "manual"
+        bl["coverage_incomplete"] = bool(incomplete)
+        if incomplete:
+            # 覆盖不全：展示截图数字，但不当作黑名单信号；计分仍看本次 DoH / coffee
+            note = "有效库仅 %s 家，覆盖不全，不当作黑名单信号" % rec.get("valid")
+            if bl.get("doh") and bl["doh"].get("total_valid"):
+                note += "（本次 DoH 抽样 有效 %s / 正常 %s / 已标记 %s / 黑名单 %s）" % (
+                    bl["doh"].get("total_valid"), bl["doh"].get("clean"),
+                    bl["doh"].get("marked"), bl["doh"].get("listed"))
+            # 计分用的 listed 不采用覆盖不全的截图（listed 即使为 0 也不要盖掉 DoH 命中）
+            if bl.get("doh"):
+                if bl["doh"].get("listed"):
+                    bl["listed"] = bl["doh"].get("listed")
+            bl["note"] = note + "（手动）"
+        else:
+            note = "黑名单计数来自手动记录"
+            if bl.get("doh") and bl["doh"].get("total_valid"):
+                note += "（本次 DoH 抽样 有效 %s / 正常 %s / 已标记 %s / 黑名单 %s）" % (
+                    bl["doh"].get("total_valid"), bl["doh"].get("clean"),
+                    bl["doh"].get("marked"), bl["doh"].get("listed"))
+            bl["note"] = note + "（手动）"
+        mail["dnsbl"] = bl
+    return mail
+
+
+def manual_dnsbl_listed(db):
+    rec = (db or {}).get("dnsbl") or {}
+    if dnsbl_coverage_incomplete(rec):
+        return 0
+    try:
+        n = int(rec.get("listed"))
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+def ipqs_risk_bits(score, source=""):
+    """综合分用的 IPQS 扣分与原因。≥75 可疑（复核），≥85 严重。"""
+    if score is None:
+        return 0, None, None  # pts, review_msg, reject_msg
+    try:
+        n = int(float(score))
+    except (TypeError, ValueError):
+        return 0, None, None
+    tag = "（手动）" if source == "manual" else ""
+    if n >= 85:
+        return -20, "IPQS %d 高风险%s" % (n, tag), "IPQS ≥ 85，高风险%s" % tag
+    if n >= 75:
+        return -10, "IPQS %d 可疑%s" % (n, tag), None
+    return 0, None, None
 
 
 def _svc(unlock, name):
@@ -2326,6 +3072,33 @@ def score_ai_use(row):
     else:
         d_unl = "未测 ChatGPT/Claude/Gemini，不加解锁分"
 
+    # IPQS 分数（≥75 可疑，≥85 严重）；额度不足的响应不会出现在这里
+    ipqs_score = row.get("ipqs_score")
+    if ipqs_score is None:
+        for s in ((row.get("sections") or {}).get("scores") or []):
+            if s.get("db") == "IPQS" and s.get("score") not in (None, "", "—"):
+                raw = str(s.get("score")).replace("（手动）", "").strip()
+                try:
+                    ipqs_score = float(raw)
+                    break
+                except (TypeError, ValueError):
+                    pass
+    try:
+        ipqs_score = int(float(ipqs_score)) if ipqs_score is not None else None
+    except (TypeError, ValueError):
+        ipqs_score = None
+    if ipqs_score is not None:
+        if ipqs_score >= 85:
+            adj -= 15
+            adj_bits.append("IPQS %d 高风险" % ipqs_score)
+        elif ipqs_score >= 75:
+            adj -= 8
+            adj_bits.append("IPQS %d 可疑" % ipqs_score)
+        else:
+            adj_bits.append("IPQS %d" % ipqs_score)
+        if adj_bits:
+            d_unl = "；".join(adj_bits)
+
     total = base + adj
     if total < 0:
         total = 0
@@ -2349,6 +3122,11 @@ def score_ai_use(row):
     reasons.append("黑名单" + ("命中" if dirty_bl else "未列"))
     if scam is not None:
         reasons.append("Scamalytics %d" % scam)
+    if ipqs_score is not None:
+        if ipqs_score >= 75:
+            reasons.append("IPQS %d %s" % (ipqs_score, "高风险" if ipqs_score >= 85 else "可疑"))
+        else:
+            reasons.append("IPQS %d" % ipqs_score)
     if host_majority:
         reasons.append("机房多数 %d:%d" % (res_n, host_n))
     elif host_n >= 2:
@@ -2356,7 +3134,7 @@ def score_ai_use(row):
     if bits:
         reasons.extend(bits)
 
-    if cg == "屏蔽" or dirty_bl or severe_abuse or high_n + low_n >= 2 or (high_n >= 1 and low_n >= 1):
+    if cg == "屏蔽" or dirty_bl or severe_abuse or high_n + low_n >= 2 or (high_n >= 1 and low_n >= 1) or (ipqs_score is not None and ipqs_score >= 85):
         verdict = "不建议"
     elif host_majority and (cg != "解锁"):
         verdict = "不建议"

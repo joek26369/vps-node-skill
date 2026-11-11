@@ -3,7 +3,7 @@ name: vps-node
 description: Pre-flight a freshly bought VPS (hardware / IP reputation / return route, nothing installed) and only then provision a production-ready proxy node — sing-box (VLESS+REALITY :443 + Hysteria2 :8443), BBR tuning, DuckDNS + Let's Encrypt HTTPS subscription endpoint, security hardening (ufw/SSH/sysctl/fail2ban), and a 9-source external IP reputation audit. Use when the user buys a new VPS, wants to set up a 节点/机场/梯子, replace a residential proxy node, or asks to harden + audit a VPS.
 description_zh: "新 VPS 上线全流程：先验货（硬件/IP 质量/回程，不装机）→ sing-box 双协议节点 + BBR + 免费域名 HTTPS 订阅 + 安全加固 + IP 风险体检 → 验收 → 服务端哨兵"
 description_en: "One-shot VPS node deployment: sing-box dual protocol, BBR, HTTPS subscription via DuckDNS+LE, hardening, IP reputation audit"
-version: 1.14.0
+version: 1.14.1
 allowed-tools: Read,Write,Edit,Bash
 display_name: "VPS 节点上线"
 visibility: "public"
@@ -442,7 +442,7 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 
 `ip-check-lite.sh` 退出码：0 = 通过（**留**）；1 = 需人工复核（**待复核**）；3 = 放弃（**换**）；2 = 参数错误。核心源（ipinfo / IPLogs / Scamalytics / coffee / ipx / iping）超时、被拦、解析失败，都至少判复核（fail-closed）。补充源失败只显示「—」，不单独拉高复核。过了快查再花钱/花时间跑全量。
 
-报告按六段输出（格式对齐常见的 IPQuality 体检），随后是原来的「情况分析」（结论、综合分、优点/风险、建议）。需要 key 的库（IPinfo 类型/privacy、ipregistry、ipapi.is 完整字段、IP2Location usage_type、IPQS、ipdata、AbuseIPDB）没有对应环境变量时显示**未配置**，不会编造数据。可选变量：`IPINFO_TOKEN`、`IPREGISTRY_KEY`、`IPAPI_IS_KEY`、`IP2LOCATION_KEY`、`IPQS_KEY`、`IPDATA_KEY`、`DBIP_API_KEY`、`ABUSEIPDB_KEY`（或 `~/.vps-node/abuseipdb.key`）。key 经 curl `--config` 传递，不写进日志或命令行。
+报告按六段输出（格式对齐常见的 IPQuality 体检），随后是原来的「情况分析」（结论、综合分、优点/风险、建议）。需要 key 的库（IPinfo 类型/privacy、ipregistry、ipapi.is 完整字段、IP2Location usage_type、IPQS、ipdata、AbuseIPDB）没有对应环境变量时显示**未配置**，不会编造数据。可选变量：`IPINFO_TOKEN`、`IPREGISTRY_KEY`、`IPAPI_IS_KEY`、`IP2LOCATION_KEY`、`IPQS_KEY`（或 `IPQS_API_KEY`）、`IPDATA_KEY`、`DBIP_API_KEY`、`ABUSEIPDB_KEY`（或 `~/.vps-node/abuseipdb.key`）。key 经 curl `--config` 传递，不写进日志或命令行。IPQS 若返回额度不足，报告显示「不可用（额度不足）」，不把该响应当分数，也不因此失败。
 
 解锁与远端 25 端口必须从目标 IP 出站：
 
@@ -460,14 +460,20 @@ bash scripts/ip-check-lite.sh --local <IP>    # 若本机出口与 <IP> 不符�
 
 # 记下在 IPQuality 等工具里看到的解锁结果（来源标「手动」，可与 --proxy 同时用）
 bash scripts/ip-check-lite.sh --note-unlock 'tiktok=原生,disney=原生,youtube=原生,amazonpv=原生,chatgpt=原生,netflix=dns,reddit=屏蔽' <IP>
+
+# 记下其他工具里的库分数 / 类型 / 标志 / 黑名单（来源标「手动」，参与计分，同 IP 下次会合并）
+bash scripts/ip-check-lite.sh --note-db 'ipqs=75,ipqs.proxy=1,ipqs.vpn=1,ip2location.type=hosting,ip2location.server=1,ipapi.type=business,ipapi.risk=2.20,abuseipdb=0,dnsbl.listed=2,dnsbl.marked=18,dnsbl.valid=423' <IP>
+
+# 清掉该 IP 已保存的手动记录后再跑（本次命令行记录仍会写入）
+bash scripts/ip-check-lite.sh --clear-notes <IP>
 ```
 
-解锁结果只写入优点/风险，**不改变** 留/换结论。ChatGPT / Reddit / Claude / Gemini 等被屏蔽会列为风险。
+解锁结果只写入优点/风险，**不改变** 留/换结论。`--note-db` 与 `--note-unlock` 会写入 `~/.vps-node/ipaudits/<IP>/notes.json`（权限 600），后续对同一 IP 的运行会合并最新手动项，除非加 `--clear-notes`。二/三/四/六段对应格子带「（手动）」标记；IPQS 代理/VPN 按高权重标志计，IPQS 分数 ≥75 为可疑、≥85 为严重，真实 DNSBL 黑名单 >0 计入风险；若手动黑名单有效库过少（例如仅 1 家），视为覆盖不全，不当作信号。ChatGPT / Reddit / Claude / Gemini 等被屏蔽会列为风险。
 
 另有「AI 适用分」（0–100），与综合分（家宽真实性）分开算：代理/VPN/Tor 和真实黑名单/AbuseIPDB 权重大（Scamalytics、IPQS 类来源比 IPLogs 这类标签扣得更重），Scamalytics Fraud Score 中等，机房票较轻（3:2 只小扣，机房多数仍重扣），登记不一致/无 PTR 很轻，主流运营商小加分。若已测或手动记录了 ChatGPT/Claude/Gemini，解锁结果权重最大：ChatGPT 解锁大幅加分，屏蔽大幅减分。情况分析里会印「AI 用途: xx / 100  建议：可用/观察/不建议」及原因。Claude（claude.ai 区域页）和 Gemini（gemini.google.com）在 `--proxy` / `--local` 时做轻量探测。
 本机 stdout 是终端时会着色，可用 `NO_COLOR=1` 关掉。
 
-每次快查结束会打印「情况分析」：结论（留 / 换 / 待复核）、硬证据一行、0–100 综合分（家宽真实性：类型投票、主流运营商加分、代理标志、Scamalytics、原生/广播、DNSBL、rDNS、源完整性；AbuseIPDB 有结果时再加减）、优点/风险/建议，以及「AI 用途」适用分与可用/观察/不建议。家宽风格 + FCrDNS 占满 rDNS 分；无 PTR 小幅扣分。待复核会写明原因：仅当完全没有实际信号时才写「仅检测源失败」；否则先列出实际信号（例如有 N 个源判机房、代理/VPN 标记），检测源失败只作为补充。机器可读摘要写在 `~/.vps-node/ipaudits/<IP>/lite-<stamp>.json`（权限 600），不含密钥。
+每次快查结束会打印「情况分析」：结论（留 / 换 / 待复核）、硬证据一行、0–100 综合分（家宽真实性：类型投票、主流运营商加分、代理标志、Scamalytics、原生/广播、DNSBL、rDNS、源完整性；AbuseIPDB / IPQS 有可用结果时再加减）、优点/风险/建议，以及「AI 用途」适用分与可用/观察/不建议。家宽风格 + FCrDNS 占满 rDNS 分；无 PTR 小幅扣分。待复核会写明原因：仅当完全没有实际信号时才写「仅检测源失败」；否则先列出实际信号（例如有 N 个源判机房、代理/VPN 标记），检测源失败只作为补充。机器可读摘要写在 `~/.vps-node/ipaudits/<IP>/lite-<stamp>.json`（权限 600），不含密钥。
 
 测了多条 IP 之后，用 `ip-compare.sh` 做整体比较。默认按综合分（家宽真实性）排名；看 ChatGPT/Claude 出口用 `--for ai` 按 AI 适用分排名（并列时优先更少的代理/VPN 标记、ChatGPT 已解锁、更低的 Scamalytics）。Markdown 报告始终同时给出两套排名。
 

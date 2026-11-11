@@ -7,12 +7,17 @@
 #   bash ip-check-lite.sh --proxy socks5h://[user:pass@]host:port <IPv4>
 #   bash ip-check-lite.sh --local [IPv4]    # 在该 IP 的机器上跑，测解锁与 25 端口
 #   bash ip-check-lite.sh --note-unlock chatgpt=ok,reddit=blocked <IPv4>
+#   bash ip-check-lite.sh --note-db 'ipqs=75,ipqs.proxy=1,ip2location.type=hosting' <IPv4>
 # 一至四段为裸 IP 查询；五、六段（解锁 / 远端 25）需要 --proxy 或 --local。
 # 黑名单在裸 IP 下也会查（DoH + coffee 服务端）。
 # 硬证据：RDAP（登记单位/网段/分配类型）与 DoH PTR + FCrDNS；失败不 fail-closed。
 # 服务器风格 PTR 计为独立机房票（rDNS）；无 PTR 小幅扣分。
 # 需要 key 的库（IPQS / ipregistry / ipdata / IP2Location 类型 / ipapi 完整字段）
 # 仅当对应环境变量存在时才查询，key 走 curl --config，不写日志、不进 argv。
+# IPQS 同时认 IPQS_KEY 与 IPQS_API_KEY；接口返回额度不足时显示「不可用（额度不足）」，
+# 不把该响应当作分数、不因此失败。可用 --note-db / --note-unlock 记下其他工具的结果
+# （来源：手动），写入 ~/.vps-node/ipaudits/<IP>/notes.json，后续同 IP 运行会合并，
+# 除非加 --clear-notes。
 #
 # 查什么:
 #   ipinfo         地理 / 组织 / 主机名（免费无 token，无 privacy/类型字段）
@@ -44,7 +49,7 @@
 #
 # 退出码: 0 通过（留）/ 1 需人工复核 / 3 放弃（换）/ 2 参数错误
 # 可选环境变量: ABUSEIPDB_KEY, IPINFO_TOKEN, IPREGISTRY_KEY, IPAPI_IS_KEY,
-#   IP2LOCATION_KEY, IPQS_KEY, IPDATA_KEY, DBIP_API_KEY
+#   IP2LOCATION_KEY, IPQS_KEY（或 IPQS_API_KEY）, IPDATA_KEY, DBIP_API_KEY
 # NO_COLOR=1 时禁用颜色（默认仅在 stdout 为 tty 时着色）
 #
 # 测试用 URL 覆盖（完整 URL，用于 fail-closed 自测）:
@@ -61,10 +66,12 @@ ABUSEIPDB_KEY="${ABUSEIPDB_KEY:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  printf '用法: ip-check-lite.sh [--proxy <url>] [--local] [--note-unlock <spec>] <IPv4>\n' >&2
+  printf '用法: ip-check-lite.sh [--proxy <url>] [--local] [--note-unlock <spec>] [--note-db <spec>] [--clear-notes] <IPv4>\n' >&2
   printf '  --proxy socks5h:// 或 http://  经该出口测解锁与远端 25（凭证不打印）\n' >&2
   printf '  --local  在本机出口上测解锁与 25；可省略 IP，自动探测\n' >&2
-  printf '  --note-unlock chatgpt=ok,reddit=blocked,...  记录在其他工具看到的解锁结果（来源：手动）\n' >&2
+  printf '  --note-unlock chatgpt=ok,reddit=blocked,...  记录在其他工具看到的解锁结果（来源：手动，会持久化）\n' >&2
+  printf '  --note-db ipqs=75,ipqs.proxy=1,...  记录其他工具的库分数/类型/标志（来源：手动，会持久化）\n' >&2
+  printf '  --clear-notes  清掉该 IP 已保存的手动记录后再跑（本次命令行记录仍会写入）\n' >&2
   printf '暂不支持 IPv6。退出码: 0 通过 / 1 复核 / 3 放弃 / 2 参数错误\n' >&2
 }
 
@@ -87,6 +94,8 @@ mask_proxy_url() {
 PROXY=""
 LOCAL_MODE=0
 NOTE_UNLOCK=""
+NOTE_DB=""
+CLEAR_NOTES=0
 IP=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -118,6 +127,20 @@ while [ $# -gt 0 ]; do
       ;;
     --note-unlock=*)
       NOTE_UNLOCK="${1#--note-unlock=}"
+      ;;
+    --note-db)
+      shift
+      NOTE_DB="${1:-}"
+      if [ -z "$NOTE_DB" ]; then
+        printf '错误: --note-db 需要一项说明，例如 ipqs=75,ipqs.proxy=1\n' >&2
+        exit 2
+      fi
+      ;;
+    --note-db=*)
+      NOTE_DB="${1#--note-db=}"
+      ;;
+    --clear-notes)
+      CLEAR_NOTES=1
       ;;
     --)
       shift
@@ -514,6 +537,10 @@ if [ -n "${IP2LOCATION_KEY:-}" ]; then
   KEY_IP2LOCATION=1
   fetch_keyed ip2location "https://api.ip2location.io/?ip=${IP}&key=${IP2LOCATION_KEY}" 15
 fi
+# 兼容官方常见变量名；只经 curl --config 使用，绝不打印
+if [ -z "${IPQS_KEY:-}" ] && [ -n "${IPQS_API_KEY:-}" ]; then
+  IPQS_KEY="${IPQS_API_KEY}"
+fi
 if [ -n "${IPQS_KEY:-}" ]; then
   KEY_IPQS=1
   fetch_keyed ipqs "https://ipqualityscore.com/api/json/ip/${IPQS_KEY}/${IP}" 15
@@ -549,6 +576,12 @@ if [ -n "$NOTE_UNLOCK" ]; then
 else
   : > "$WORKDIR/note_unlock.txt"
 fi
+if [ -n "$NOTE_DB" ]; then
+  printf '%s\n' "$NOTE_DB" > "$WORKDIR/note_db.txt"
+  chmod 600 "$WORKDIR/note_db.txt" 2>/dev/null || true
+else
+  : > "$WORKDIR/note_db.txt"
+fi
 
 {
   printf 'abuse_enabled=%s\n' "$ABUSE_ENABLED"
@@ -568,10 +601,13 @@ fi
   printf 'key_ipdata=%s\n' "$KEY_IPDATA"
   printf 'key_dbip=%s\n' "$KEY_DBIP"
   printf 'note_unlock_file=%s\n' "$WORKDIR/note_unlock.txt"
+  printf 'note_db_file=%s\n' "$WORKDIR/note_db.txt"
+  printf 'clear_notes=%s\n' "$CLEAR_NOTES"
+  printf 'audit_root=%s\n' "${HOME}/.vps-node/ipaudits"
 } > "$WORKDIR/meta.txt"
 
 # 清掉环境里的 key，防止任何子进程或调试输出带出
-unset ABUSEIPDB_KEY IPINFO_TOKEN IPREGISTRY_KEY IPAPI_IS_KEY IP2LOCATION_KEY IPQS_KEY IPDATA_KEY DBIP_API_KEY
+unset ABUSEIPDB_KEY IPINFO_TOKEN IPREGISTRY_KEY IPAPI_IS_KEY IP2LOCATION_KEY IPQS_KEY IPQS_API_KEY IPDATA_KEY DBIP_API_KEY
 
 {
   printf '== 裸 IP 快查: %s  %s ==\n' "$IP" "$(date '+%F %T')"
@@ -714,6 +750,33 @@ _script_dir = meta.get("script_dir") or ""
 if _script_dir and _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 import ipcheck_report as ipr
+
+# 手动记录（--note-db / --note-unlock）：与已保存的 notes.json 合并
+AUDIT_ROOT = meta.get("audit_root") or os.path.expanduser("~/.vps-node/ipaudits")
+CLEAR_NOTES = meta.get("clear_notes") == "1"
+
+def _read_note_file(path):
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        return open(path, encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+
+note_unlock_spec = _read_note_file(meta.get("note_unlock_file") or os.path.join(WORKDIR, "note_unlock.txt"))
+note_db_spec = _read_note_file(meta.get("note_db_file") or os.path.join(WORKDIR, "note_db.txt"))
+_saved_notes = {} if CLEAR_NOTES else ipr.load_notes(AUDIT_ROOT, IP)
+_cli_db = ipr.parse_note_db(note_db_spec) if note_db_spec else {}
+_cli_unlock = ipr.parse_note_unlock(note_unlock_spec) if note_unlock_spec else []
+notes_merged = ipr.merge_notes(_saved_notes, _cli_db, _cli_unlock, clear=CLEAR_NOTES)
+notes_db = notes_merged.get("db") or {}
+# 实时 IPQS（额度不足不当数据）；手动分数可补上
+_ipqs_body = ipr.read_json_body(WORKDIR, "ipqs")
+_ipqs_http = ipr.http_of(WORKDIR, "ipqs")
+ipqs_score, ipqs_src = ipr.ipqs_score_from(
+    notes_db, extras={"ipqs": {"data": _ipqs_body, "http": _ipqs_http}}
+)
+ipqs_insp = ipr.inspect_ipqs(_ipqs_body, _ipqs_http)
 
 # ---------- 通用 ----------
 def looks_cloudflare(html):
@@ -1292,6 +1355,28 @@ rdns_info = ipr.lookup_rdns(IP)
 if rdns_info.get("style") == "host":
     type_voters.append(("rDNS", "host", "PTR %s" % (rdns_info.get("ptr") or "")))
 
+# 手动库类型票 / 代理标志（与实时同源不重复计票）
+def _base_title(title):
+    return (title or "").replace("（手动）", "").strip()
+
+_live_type = {_base_title(t) for t, _, _ in type_voters}
+for title, vote, note in ipr.manual_type_votes(notes_db):
+    if _base_title(title) in _live_type:
+        continue
+    type_voters.append((title, vote, note))
+    _live_type.add(_base_title(title))
+_flag_idx = {_base_title(t): i for i, (t, _) in enumerate(flag_voters)}
+for title, flags in ipr.manual_flag_voters(notes_db):
+    b = _base_title(title)
+    if b in _flag_idx:
+        cur = flag_voters[_flag_idx[b]][1]
+        for f in flags:
+            if f not in cur:
+                cur.append(f)
+    else:
+        flag_voters.append((title, flags))
+        _flag_idx[b] = len(flag_voters) - 1
+
 res_n = sum(1 for _, v, _ in type_voters if v == "res")
 host_n = sum(1 for _, v, _ in type_voters if v == "host")
 host_sources = [title for title, v, _ in type_voters if v == "host"]
@@ -1499,6 +1584,14 @@ cof = sources["coffee"]
 if cof.get("_dnsbl_ok"):
     if cof.get("_dnsbl_hits"):
         review.append("DNSBL 命中非 PBL 名单: %s" % "; ".join(cof["_dnsbl_hits"]))
+manual_listed = ipr.manual_dnsbl_listed(notes_db)
+if manual_listed > 0:
+    review.append("DNSBL 黑名单 %d 条（手动）" % manual_listed)
+_ipqs_pts, _ipqs_review, _ipqs_reject = ipr.ipqs_risk_bits(ipqs_score, ipqs_src or "")
+if _ipqs_reject:
+    reject.append(_ipqs_reject)
+elif _ipqs_review:
+    review.append(_ipqs_review)
     if cof.get("_dnsbl_pbl"):
         notes.append("%s —— 家宽段常见，不视为不干净" % "; ".join(cof["_dnsbl_pbl"]))
 
@@ -1521,6 +1614,15 @@ if ab["enabled"] and ab["ok"]:
         review.append("AbuseIPDB 需复核（score=%s, totalReports(90d)=%s）" % (ascore, reps))
     elif reps_n > 0:
         notes.append("AbuseIPDB 近 90 天有 %s 条举报，score=%s（未达复核线）" % (reps, ascore))
+elif (notes_db.get("abuseipdb") or {}).get("score") is not None:
+    try:
+        _mab = int(float(notes_db["abuseipdb"]["score"]))
+    except (TypeError, ValueError):
+        _mab = None
+    if _mab is not None and _mab >= 75:
+        reject.append("AbuseIPDB score %s ≥ 75（手动），建议放弃" % _mab)
+    elif _mab is not None and _mab >= 25:
+        review.append("AbuseIPDB 需复核（score=%s，手动）" % _mab)
 
 # IPLogs verdict
 il = sources["iplogs"]
@@ -1751,6 +1853,13 @@ def pts_native():
 
 def pts_dnsbl():
     cof = sources["coffee"]
+    manual_n = ipr.manual_dnsbl_listed(notes_db)
+    if manual_n > 0:
+        extra = "; ".join(cof.get("_dnsbl_hits") or [])
+        msg = "手动记录黑名单 %d 条" % manual_n
+        if extra:
+            msg += "；本次抽样命中 " + extra
+        return 0, msg + "（手动）"
     if not cof.get("_dnsbl_ok"):
         return 3, "未测到"
     if cof.get("_dnsbl_hits"):
@@ -1772,9 +1881,23 @@ def pts_sources():
 
 def pts_abuse():
     ab = sources["abuseipdb"]
-    if not ab["enabled"]:
-        return None, "未配置，不计入"
-    if not ab["ok"]:
+    if not ab["enabled"] or not ab["ok"]:
+        rec = notes_db.get("abuseipdb") or {}
+        if rec.get("score") is not None:
+            try:
+                ascore_n = int(float(rec["score"]))
+            except (TypeError, ValueError):
+                ascore_n = None
+            if ascore_n is None:
+                pass
+            elif ascore_n >= 75:
+                return -15, "score %s，放弃线（手动）" % ascore_n
+            elif ascore_n >= 25:
+                return -8, "score=%s（手动）" % ascore_n
+            else:
+                return 0, "干净（score=%s，手动）" % ascore_n
+        if not ab["enabled"]:
+            return None, "未配置，不计入"
         return -0, "查询失败（已计入源失败）"
     ascore = ab.get("_abuse_score")
     reps = ab.get("_abuse_reports") or 0
@@ -1801,10 +1924,25 @@ p_bl, d_bl = pts_dnsbl()
 p_rdns, d_rdns = pts_rdns()
 p_src, d_src = pts_sources()
 p_ab, d_ab = pts_abuse()
+p_ipqs, d_ipqs = _ipqs_pts, None
+if ipqs_score is not None:
+    p_ipqs, _rev_i, _rej_i = ipr.ipqs_risk_bits(ipqs_score, ipqs_src or "")
+    if ipqs_score >= 85:
+        d_ipqs = "%d 高风险%s" % (ipqs_score, "（手动）" if ipqs_src == "manual" else "")
+    elif ipqs_score >= 75:
+        d_ipqs = "%d 可疑%s" % (ipqs_score, "（手动）" if ipqs_src == "manual" else "")
+    else:
+        d_ipqs = "干净（score=%s%s）" % (ipqs_score, "，手动" if ipqs_src == "manual" else "")
+elif ipqs_insp.get("status") == "no_credits":
+    p_ipqs, d_ipqs = 0, "不可用（额度不足），不计入"
+else:
+    p_ipqs, d_ipqs = 0, "未配置/无可用数据，不计入"
 
 score_total = p_type + p_bonus + p_flags + p_scam + p_nat + p_bl + p_rdns + p_src
 if p_ab is not None:
     score_total += p_ab
+if ipqs_score is not None:
+    score_total += p_ipqs
 if score_total < 0:
     score_total = 0
 if score_total > 100:
@@ -1824,6 +1962,10 @@ if p_ab is not None:
     breakdown.append(("AbuseIPDB", p_ab, 0, d_ab))
 else:
     breakdown.append(("AbuseIPDB", 0, 0, d_ab))
+if ipqs_score is not None:
+    breakdown.append(("IPQS", p_ipqs, 0, d_ipqs))
+else:
+    breakdown.append(("IPQS", 0, 0, d_ipqs))
 
 # 复核原因：源失败 vs 真实信号。仅当完全没有实际信号时，才写「仅检测源失败」。
 src_fail_reviews = [x for x in review if "启用源失败" in x or "fail-closed" in x]
@@ -1860,6 +2002,12 @@ def real_signal_phrases():
     cof0 = sources["coffee"]
     if cof0.get("_dnsbl_ok") and cof0.get("_dnsbl_hits"):
         phrases.append("DNSBL 命中非 PBL 名单")
+    if manual_listed > 0:
+        phrases.append("DNSBL 黑名单 %d 条（手动）" % manual_listed)
+    if ipqs_score is not None and ipqs_score >= 75:
+        phrases.append("IPQS %d %s%s" % (
+            ipqs_score, "高风险" if ipqs_score >= 85 else "可疑",
+            "（手动）" if ipqs_src == "manual" else ""))
     ab0 = sources["abuseipdb"]
     if ab0["enabled"] and ab0["ok"]:
         try:
@@ -1896,7 +2044,7 @@ signal_phrases = real_signal_phrases()
 # 判定依据里还有、但上面没结构化到的实际复核项，补进原因，避免漏信号
 structured_markers = ("有 %d 个源判机房" % host_n, "类型投票未通过", "代理/VPN/Tor",
                       "Scamalytics Fraud Score", "Scamalytics 标记", "广播", "非原生",
-                      "DNSBL", "AbuseIPDB", "IPLogs verdict", "rDNS 呈机房",
+                      "DNSBL", "AbuseIPDB", "IPQS", "IPLogs verdict", "rDNS 呈机房",
                       "登记单位", "转租", "IPXO", "租赁")
 for x in other_reviews:
     if any(m in x for m in structured_markers):
@@ -1974,6 +2122,16 @@ if cof.get("_dnsbl_ok"):
         pros.append("黑名单仅 Spamhaus PBL（家宽正常）")
     else:
         pros.append("DNSBL 未列")
+if manual_listed > 0:
+    # 覆盖上面「未列」的误导
+    cons.append("DNSBL 黑名单 %d 条（手动）" % manual_listed)
+    pros[:] = [x for x in pros if x != "DNSBL 未列"]
+if ipqs_score is not None and ipqs_score >= 75:
+    cons.append("IPQS %d %s%s" % (
+        ipqs_score, "高风险" if ipqs_score >= 85 else "可疑",
+        "（手动）" if ipqs_src == "manual" else ""))
+elif ipqs_score is not None and ipqs_score == 0:
+    pros.append("IPQS 0（手动）" if ipqs_src == "manual" else "IPQS 0")
 if rdns_res:
     if rdns_info.get("fcrdns"):
         pros.append("rDNS 呈家宽风格且正反向确认（FCrDNS）")
@@ -2066,15 +2224,9 @@ if mode in ("proxy", "local"):
     elif mode == "proxy":
         remote25 = ipr.check_remote25(cfg=proxy_cfg or None)
 
-# 手动解锁记录（--note-unlock），来源标为「手动」
-note_spec = ""
-_nf = meta.get("note_unlock_file") or os.path.join(WORKDIR, "note_unlock.txt")
-try:
-    if _nf and os.path.isfile(_nf):
-        note_spec = open(_nf, encoding="utf-8").read().strip()
-except OSError:
-    note_spec = ""
-manual_items = ipr.parse_note_unlock(note_spec) if note_spec else []
+# 手动解锁记录（本次 --note-unlock + 已保存），来源标为「手动」
+note_spec = note_unlock_spec
+manual_items = list(notes_merged.get("unlock") or [])
 if manual_items:
     unlock = ipr.merge_manual_unlock(unlock, manual_items)
 
@@ -2089,6 +2241,8 @@ section_report = ipr.build_report({
     "remote25": remote25,
     "dnsbl": dnsbl,
     "hard": hard,
+    "notes": notes_merged,
+    "manual_db": notes_db,
 })
 ipr.print_report(section_report, color=ipr.want_color())
 _up, _uc = ipr.unlock_pros_cons(unlock)
@@ -2117,13 +2271,17 @@ ai = ipr.score_ai_use({
     },
     "dnsbl_hits": list(cof.get("_dnsbl_hits") or []),
     "dnsbl_pbl": list(cof.get("_dnsbl_pbl") or []),
-    "abuseipdb": _ab_live,
+    "abuseipdb": _ab_live or (
+        {"score": (notes_db.get("abuseipdb") or {}).get("score")}
+        if (notes_db.get("abuseipdb") or {}).get("score") is not None else {}
+    ),
     "hard_evidence": hard,
     "operator_bonus": bool(bonus_applied),
     "operator_kind": (op_hit or {}).get("kind") if op_hit else None,
     "operator": (op_hit or {}).get("brand") if op_hit else None,
     "unlock": unlock,
-    "sections": {"mail": {"dnsbl": dnsbl}, "unlock": unlock, "hard_evidence": hard},
+    "ipqs_score": ipqs_score,
+    "sections": section_report,
 })
 
 print()
@@ -2139,6 +2297,10 @@ for name, got, mx, detail in breakdown:
     if name == "AbuseIPDB" and p_ab is None:
         print("  %-16s %4s  %s" % (name, "—", detail))
     elif name == "AbuseIPDB":
+        print("  %-16s %+4d  %s" % (name, got, detail))
+    elif name == "IPQS" and ipqs_score is None:
+        print("  %-16s %4s  %s" % (name, "—", detail))
+    elif name == "IPQS":
         print("  %-16s %+4d  %s" % (name, got, detail))
     else:
         print("  %-16s %2d/%-2d  %s" % (name, got, mx, detail))
@@ -2219,7 +2381,20 @@ summary = {
     "ai_summary": ai.get("summary"),
     "unlock": unlock,
     "note_unlock": note_spec or None,
-    "abuseipdb": _ab_live or None,
+    "note_db": note_db_spec or None,
+    "manual_notes": {
+        "updated": notes_merged.get("updated"),
+        "observed": notes_merged.get("observed"),
+        "source": "手动",
+        "db": notes_db,
+        "unlock": notes_merged.get("unlock") or [],
+    } if (notes_db or notes_merged.get("unlock")) else None,
+    "ipqs_score": ipqs_score,
+    "ipqs_source": ipqs_src,
+    "abuseipdb": _ab_live or (
+        {"score": (notes_db.get("abuseipdb") or {}).get("score"), "source": "手动"}
+        if (notes_db.get("abuseipdb") or {}).get("score") is not None else None
+    ),
 }
 
 json_path = meta.get("json_path") or ""
@@ -2232,6 +2407,14 @@ if json_path:
         print("JSON: %s" % json_path)
     except OSError as e:
         print("JSON 写入失败: %s" % e)
+
+# 持久化手动记录（同 IP 下次合并，除非 --clear-notes 且本次没有新记录）
+if CLEAR_NOTES and not notes_db and not (notes_merged.get("unlock") or []):
+    ipr.clear_notes_file(AUDIT_ROOT, IP)
+else:
+    _np = ipr.save_notes(AUDIT_ROOT, IP, notes_merged)
+    if _np:
+        print("手动记录: %s" % _np)
 
 # 给 bash 的退出码文件（不依赖管道）
 with open(os.path.join(WORKDIR, "exit_code"), "w", encoding="utf-8") as f:

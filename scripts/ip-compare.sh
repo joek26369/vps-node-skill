@@ -472,10 +472,20 @@ def native_cell(r):
 def bl_cell(r):
     hits = r.get("dnsbl_hits") or []
     pbl = r.get("dnsbl_pbl") or []
-    if hits:
-        return "命中"
+    mail_bl = ((r.get("sections") or {}).get("mail") or {}).get("dnsbl") or {}
+    # 覆盖不全的手动计数不当信号（例如有效库仅 1 家）
+    incomplete = bool(mail_bl.get("coverage_incomplete"))
+    try:
+        listed = int(mail_bl.get("listed") or 0)
+    except (TypeError, ValueError):
+        listed = 0
+    if not incomplete and (hits or listed > 0):
+        n = listed if listed > 0 else len(hits)
+        return "命中" if n <= 0 else ("命中 %d" % n if listed > 0 else "命中")
     if pbl:
         return "仅 PBL"
+    if incomplete:
+        return "覆盖不全"
     return "未列"
 
 def time_cell(r):
