@@ -9,6 +9,9 @@
 #   bash ip-compare.sh --mask <IP...>        # 表格里把 IP 打成 a.b.*.*，方便外传
 #   bash ip-compare.sh --since 7d --all      # 只纳入该时间窗口内的最新结果
 #
+# 除排名表外，还会按六段（基础信息 / 类型 / 评分 / 因子 / 解锁 / 邮局黑名单）汇总。
+# 解锁未跑时显示「未测」。终端用紧凑表，Markdown 含因子明细。
+#
 # 每条 IP 读取 ~/.vps-node/ipaudits/<IP>/ 下最新的 lite-*.json。
 # 没有 JSON 的 IP 会提示先跑 ip-check-lite.sh 或加 --rerun。
 # 比较报告同时写到 ~/.vps-node/ipaudits/compare-<stamp>.md（600）。
@@ -189,9 +192,14 @@ export IPCOMPARE_MASK="$MASK"
 export IPCOMPARE_SINCE="$SINCE"
 export IPCOMPARE_MD="$MD"
 export IPCOMPARE_MISSING="$MISSING"
+export IPCOMPARE_LIB="$SCRIPT_DIR"
 python3 - "$MANIFEST" <<'PY'
 import json, os, re, sys
 from datetime import datetime, timedelta
+_lib = os.environ.get("IPCOMPARE_LIB") or ""
+if _lib and _lib not in sys.path:
+    sys.path.insert(0, _lib)
+import ipcheck_report as ipr
 
 manifest = sys.argv[1]
 mask = os.environ.get("IPCOMPARE_MASK") == "1"
@@ -453,6 +461,13 @@ table_md = fmt_table(vals_list)
 print(table_md)
 print()
 
+# 六段汇总（终端紧凑表）
+for r in rows:
+    r["_display_ip"] = display_ip(r["_ip"])
+sec_term, sec_md = ipr.format_compare_section_tables(rows)
+print("======== 六段汇总 ========")
+print(sec_term)
+
 # 警告
 warnings = []
 for r in rows:
@@ -539,6 +554,8 @@ md_lines.append("")
 md_lines.append("比较时间: %s" % now.strftime("%Y-%m-%d %H:%M:%S"))
 md_lines.append("")
 md_lines.append(table_md)
+md_lines.append("")
+md_lines.append(sec_md)
 md_lines.append("")
 if warnings:
     md_lines.append("## 注意")

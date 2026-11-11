@@ -4,6 +4,12 @@
 #
 # 用法:
 #   bash ip-check-lite.sh <IPv4>
+#   bash ip-check-lite.sh --proxy socks5h://[user:pass@]host:port <IPv4>
+#   bash ip-check-lite.sh --local [IPv4]    # 在该 IP 的机器上跑，测解锁与 25 端口
+# 一至四段为裸 IP 查询；五、六段（解锁 / 远端 25）需要 --proxy 或 --local。
+# 黑名单在裸 IP 下也会查（DoH + coffee 服务端）。
+# 需要 key 的库（IPQS / ipregistry / ipdata / IP2Location 类型 / ipapi 完整字段）
+# 仅当对应环境变量存在时才查询，key 走 curl --config，不写日志、不进 argv。
 #
 # 查什么:
 #   ipinfo         地理 / 组织 / 主机名（免费无 token，无 privacy/类型字段）
@@ -34,6 +40,9 @@
 #   ~/.vps-node/ipaudits/<IP>/lite-<stamp>.json（600），供 ip-compare.sh 汇总比较。
 #
 # 退出码: 0 通过（留）/ 1 需人工复核 / 3 放弃（换）/ 2 参数错误
+# 可选环境变量: ABUSEIPDB_KEY, IPINFO_TOKEN, IPREGISTRY_KEY, IPAPI_IS_KEY,
+#   IP2LOCATION_KEY, IPQS_KEY, IPDATA_KEY, DBIP_API_KEY
+# NO_COLOR=1 时禁用颜色（默认仅在 stdout 为 tty 时着色）
 #
 # 测试用 URL 覆盖（完整 URL，用于 fail-closed 自测）:
 #   IPCHECK_IPINFO_URL IPCHECK_IPLOGS_URL IPCHECK_SCAMALYTICS_URL
@@ -46,16 +55,107 @@ UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/13
 KEYFILE="${HOME}/.vps-node/abuseipdb.key"
 ABUSEIPDB_KEY="${ABUSEIPDB_KEY:-}"
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 usage() {
-  printf '用法: ip-check-lite.sh <IPv4>\n' >&2
+  printf '用法: ip-check-lite.sh [--proxy <url>] [--local] <IPv4>\n' >&2
+  printf '  --proxy socks5h:// 或 http://  经该出口测解锁与远端 25（凭证不打印）\n' >&2
+  printf '  --local  在本机出口上测解锁与 25；可省略 IP，自动探测\n' >&2
   printf '暂不支持 IPv6。退出码: 0 通过 / 1 复核 / 3 放弃 / 2 参数错误\n' >&2
 }
 
-# ---- 参数与 IPv4 校验 ----
-IP="${1:-}"
-if [ "$IP" = "-h" ] || [ "$IP" = "--help" ]; then
-  usage
+mask_proxy_url() {
+  # socks5h://user:pass@host:port -> socks5h://***@host:port
+  _u="$1"
+  case "$_u" in
+    *://*@*)
+      _sch="${_u%%://*}://"
+      _rest="${_u#*://}"
+      printf '%s***@%s' "$_sch" "${_rest#*@}"
+      ;;
+    *)
+      printf '%s' "$_u"
+      ;;
+  esac
+}
+
+# ---- 参数 ----
+PROXY=""
+LOCAL_MODE=0
+IP=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 2
+      ;;
+    --local)
+      LOCAL_MODE=1
+      ;;
+    --proxy)
+      shift
+      PROXY="${1:-}"
+      if [ -z "$PROXY" ]; then
+        printf '错误: --proxy 需要一个 URL（socks5h:// 或 http://）\n' >&2
+        exit 2
+      fi
+      ;;
+    --proxy=*)
+      PROXY="${1#--proxy=}"
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      printf '未知参数: %s\n' "$1" >&2
+      usage
+      exit 2
+      ;;
+    *)
+      if [ -n "$IP" ]; then
+        printf '多余参数: %s\n' "$1" >&2
+        usage
+        exit 2
+      fi
+      IP="$1"
+      ;;
+  esac
+  shift
+done
+
+if [ -n "$PROXY" ] && [ "$LOCAL_MODE" = 1 ]; then
+  printf '错误: --proxy 与 --local 不能一起用\n' >&2
   exit 2
+fi
+if [ -n "$PROXY" ]; then
+  case "$PROXY" in
+    socks5h://*|socks5://*|socks4://*|http://*|https://*) ;;
+    *)
+      printf '错误: --proxy 只支持 socks5h://、socks5://、socks4://、http://、https://\n' >&2
+      exit 2
+      ;;
+  esac
+fi
+
+detect_self_ip() {
+  _u=""
+  for _ep in https://api.ipify.org https://icanhazip.com https://ifconfig.me/ip; do
+    _u=$(curl -sS --max-time 6 "$_ep" 2>/dev/null | tr -d '[:space:]') || true
+    case "$_u" in
+      [0-9]*.[0-9]*.[0-9]*.[0-9]*) printf '%s' "$_u"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+if [ -z "$IP" ] && [ "$LOCAL_MODE" = 1 ]; then
+  IP=$(detect_self_ip) || true
+  if [ -z "$IP" ]; then
+    printf '错误: --local 未能探测到本机出口 IP，请显式传入 IPv4\n' >&2
+    exit 2
+  fi
+  printf '本机出口 IP: %s\n' "$IP"
 fi
 if [ -z "$IP" ]; then
   usage
@@ -193,7 +293,7 @@ WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/ip-check-lite.XXXXXX")
 CLEANUP() {
   # 确保 key 头文件被删掉
   if [ -n "${WORKDIR:-}" ]; then
-    rm -f "$WORKDIR"/abuse.curl.cfg
+    rm -f "$WORKDIR"/*.curl.cfg
     rm -rf "$WORKDIR"
   fi
 }
@@ -208,6 +308,10 @@ trap CLEANUP EXIT
 : "${IPCHECK_IPX_URL:=https://ipx.al/api/report/${IP}}"
 : "${IPCHECK_IPING_URL:=https://api.iping.cc/v1/query?ip=${IP}&language=en}"
 : "${IPCHECK_ABUSEIPDB_URL:=https://api.abuseipdb.com/api/v2/check?ipAddress=${IP}&maxAgeInDays=90}"
+: "${IPCHECK_IPWHO_URL:=https://ipwho.is/${IP}}"
+: "${IPCHECK_IPAPI_IS_URL:=https://api.ipapi.is/?q=${IP}}"
+: "${IPCHECK_DBIP_URL:=https://api.db-ip.com/v2/free/${IP}}"
+: "${IPCHECK_IP2LOCATION_URL:=https://api.ip2location.io/?ip=${IP}}"
 
 # 把本次要用的 URL 写进清单，给 python 做来源名映射（不含 key）
 {
@@ -219,6 +323,10 @@ trap CLEANUP EXIT
   printf 'ipx %s\n' "$IPCHECK_IPX_URL"
   printf 'iping %s\n' "$IPCHECK_IPING_URL"
   printf 'abuseipdb %s\n' "$IPCHECK_ABUSEIPDB_URL"
+  printf 'ipwho %s\n' "$IPCHECK_IPWHO_URL"
+  printf 'ipapi_is %s\n' "$IPCHECK_IPAPI_IS_URL"
+  printf 'dbip %s\n' "$IPCHECK_DBIP_URL"
+  printf 'ip2location %s\n' "$IPCHECK_IP2LOCATION_URL"
 } > "$WORKDIR/urls.txt"
 
 fetch_one() {
@@ -266,6 +374,38 @@ EOF
   printf '%s' "$http" > "$codef"
 }
 
+# 带密钥的请求：key 只写进 600 配置，不出现在 argv
+fetch_keyed() {
+  # $1=name $2=url $3=timeout $4=optional extra header line (already "header = ...")
+  local name="$1" url="$2" t="$3" extra="${4:-}"
+  local body="$WORKDIR/${name}.body"
+  local codef="$WORKDIR/${name}.code"
+  local errf="$WORKDIR/${name}.err"
+  local cfg="$WORKDIR/${name}.curl.cfg"
+  : > "$body"
+  : > "$errf"
+  printf '000' > "$codef"
+  {
+    printf 'silent\n'
+    printf 'show-error\n'
+    printf 'location\n'
+    printf 'max-time = %s\n' "$t"
+    printf 'user-agent = "%s"\n' "$UA"
+    printf 'output = "%s"\n' "$body"
+    printf 'write-out = "%%{http_code}"\n'
+    printf 'url = "%s"\n' "$url"
+    if [ -n "$extra" ]; then
+      printf '%s\n' "$extra"
+    fi
+  } > "$cfg"
+  chmod 600 "$cfg"
+  local http
+  http=$(curl --config "$cfg" 2>"$errf") || true
+  rm -f "$cfg"
+  [ -n "$http" ] || http=000
+  printf '%s' "$http" > "$codef"
+}
+
 # ---- 并发拉取 ----
 fetch_one ipinfo "$IPCHECK_IPINFO_URL" 15 &
 _p1=$!
@@ -292,18 +432,94 @@ for _p in "$_p1" "$_p2" "$_p3" "$_p4" "$_p5" "$_p6" "$_p7" "$_p8"; do
   wait "$_p" || true
 done
 
+# 补充免费源（小并发，失败不 fail-closed）
+fetch_one ipwho "$IPCHECK_IPWHO_URL" 12 &
+_e1=$!
+fetch_one ipapi_is "$IPCHECK_IPAPI_IS_URL" 12 &
+_e2=$!
+fetch_one dbip "$IPCHECK_DBIP_URL" 12 &
+_e3=$!
+fetch_one ip2location "$IPCHECK_IP2LOCATION_URL" 12 &
+_e4=$!
+for _p in "$_e1" "$_e2" "$_e3" "$_e4"; do
+  wait "$_p" || true
+done
+
+# 可选付费/注册 key（仅当环境变量存在；不 fail-closed）
+KEY_IPINFO=0
+KEY_IPREGISTRY=0
+KEY_IPAPI_IS=0
+KEY_IP2LOCATION=0
+KEY_IPQS=0
+KEY_IPDATA=0
+KEY_DBIP=0
+if [ -n "${IPINFO_TOKEN:-}" ]; then
+  KEY_IPINFO=1
+  fetch_keyed ipinfo "https://ipinfo.io/${IP}/json" 15 "user = \"${IPINFO_TOKEN}:\""
+  fetch_keyed ipinfo_full "https://ipinfo.io/${IP}/json?fields=ip,city,region,country,loc,org,postal,timezone,privacy,asn,company,abuse" 15 "user = \"${IPINFO_TOKEN}:\""
+fi
+if [ -n "${IPREGISTRY_KEY:-}" ]; then
+  KEY_IPREGISTRY=1
+  fetch_keyed ipregistry "https://api.ipregistry.co/${IP}?hostname=true&key=${IPREGISTRY_KEY}" 15
+fi
+if [ -n "${IPAPI_IS_KEY:-}" ]; then
+  KEY_IPAPI_IS=1
+  fetch_keyed ipapi_is "https://api.ipapi.is/?q=${IP}&key=${IPAPI_IS_KEY}" 15
+fi
+if [ -n "${IP2LOCATION_KEY:-}" ]; then
+  KEY_IP2LOCATION=1
+  fetch_keyed ip2location "https://api.ip2location.io/?ip=${IP}&key=${IP2LOCATION_KEY}" 15
+fi
+if [ -n "${IPQS_KEY:-}" ]; then
+  KEY_IPQS=1
+  fetch_keyed ipqs "https://ipqualityscore.com/api/json/ip/${IPQS_KEY}/${IP}" 15
+fi
+if [ -n "${IPDATA_KEY:-}" ]; then
+  KEY_IPDATA=1
+  fetch_keyed ipdata "https://api.ipdata.co/${IP}?api-key=${IPDATA_KEY}" 15
+fi
+if [ -n "${DBIP_API_KEY:-}" ]; then
+  KEY_DBIP=1
+  fetch_keyed dbip "https://api.db-ip.com/v2/${DBIP_API_KEY}/${IP}" 15
+fi
+
+# 代理配置（凭证只进 600 文件）
+PROXY_CFG=""
+PROXY_MASKED=""
+MODE=bare
+if [ -n "$PROXY" ]; then
+  MODE=proxy
+  PROXY_MASKED=$(mask_proxy_url "$PROXY")
+  PROXY_CFG="$WORKDIR/proxy.curl.cfg"
+  printf 'proxy = "%s"\n' "$PROXY" > "$PROXY_CFG"
+  chmod 600 "$PROXY_CFG"
+fi
+if [ "$LOCAL_MODE" = 1 ]; then
+  MODE=local
+fi
+
 # ---- 判定（响应经文件传入 python，不插进源码）----
-# 把启用状态写成小清单，避免 python 读到 key
 {
   printf 'abuse_enabled=%s\n' "$ABUSE_ENABLED"
   printf 'abuse_skip=%s\n' "$ABUSE_SKIP_MSG"
   printf 'ip=%s\n' "$IP"
   printf 'timestamp=%s\n' "$WHEN"
   printf 'json_path=%s\n' "$JSON_OUT"
+  printf 'script_dir=%s\n' "$HERE"
+  printf 'mode=%s\n' "$MODE"
+  printf 'proxy_masked=%s\n' "$PROXY_MASKED"
+  printf 'proxy_cfg=%s\n' "$PROXY_CFG"
+  printf 'key_ipinfo=%s\n' "$KEY_IPINFO"
+  printf 'key_ipregistry=%s\n' "$KEY_IPREGISTRY"
+  printf 'key_ipapi_is=%s\n' "$KEY_IPAPI_IS"
+  printf 'key_ip2location=%s\n' "$KEY_IP2LOCATION"
+  printf 'key_ipqs=%s\n' "$KEY_IPQS"
+  printf 'key_ipdata=%s\n' "$KEY_IPDATA"
+  printf 'key_dbip=%s\n' "$KEY_DBIP"
 } > "$WORKDIR/meta.txt"
 
 # 清掉环境里的 key，防止任何子进程或调试输出带出
-unset ABUSEIPDB_KEY
+unset ABUSEIPDB_KEY IPINFO_TOKEN IPREGISTRY_KEY IPAPI_IS_KEY IP2LOCATION_KEY IPQS_KEY IPDATA_KEY DBIP_API_KEY
 
 {
   printf '== 裸 IP 快查: %s  %s ==\n' "$IP" "$(date '+%F %T')"
@@ -442,6 +658,10 @@ for line in read(os.path.join(WORKDIR, "meta.txt")).splitlines():
 IP = meta.get("ip", "")
 abuse_enabled = meta.get("abuse_enabled") == "1"
 abuse_skip = meta.get("abuse_skip", "")
+_script_dir = meta.get("script_dir") or ""
+if _script_dir and _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+import ipcheck_report as ipr
 
 # ---------- 通用 ----------
 def looks_cloudflare(html):
@@ -574,6 +794,8 @@ else:
         if d.get("hostname"):
             s["hostnames"].append(d.get("hostname"))
         add_ident(s, d.get("org"), asn=d.get("org") or d.get("asn"), city=d.get("city"), country=d.get("country"))
+        s["timezone"] = d.get("timezone")
+        s["raw_loc"] = d.get("loc")
 
 # ---- IPLogs ----
 s = add("iplogs", "IPLogs")
@@ -655,6 +877,16 @@ else:
         verdict = vm.group(1) if vm else None
         s["_score"] = score
         s["_risk"] = verdict
+        def yn_cell(val):
+            if val is None:
+                return None
+            l = val.lower().strip()
+            if l in ("yes", "true", "1"):
+                return True
+            if l in ("no", "false", "0"):
+                return False
+            return None
+
         flags_map = {
             "Anonymizing VPN": "vpn",
             "Tor Exit Node": "tor",
@@ -664,12 +896,20 @@ else:
         }
         server = cell("Server")
         s["_server"] = server
+        flag_yn = {"vpn": None, "proxy": None, "tor": None}
         for lab, flag in flags_map.items():
             val = cell(lab)
             s["detail_lines"].append("  %s: %s" % (lab, val if val is not None else "?"))
-            if val and val.lower() in ("yes", "true", "1"):
+            parsed = yn_cell(val)
+            if parsed is True:
                 if flag not in s["flags"]:
                     s["flags"].append(flag)
+                flag_yn[flag] = True
+            elif parsed is False and flag_yn[flag] is not True:
+                flag_yn[flag] = False
+        s["_vpn"] = flag_yn["vpn"]
+        s["_proxy"] = flag_yn["proxy"]
+        s["_tor"] = flag_yn["tor"]
         s["detail_lines"].insert(0, "  fraud_score: %s" % score)
         s["detail_lines"].insert(1, "  verdict: %s" % (verdict or "?"))
         s["detail_lines"].append("  Server: %s" % (server if server is not None else "?"))
@@ -966,6 +1206,7 @@ else:
             usage = data.get("usageType")
             s["_abuse_score"] = score
             s["_abuse_reports"] = reports
+            s["_usage"] = usage
             s["detail_lines"].append(
                 "  abuseConfidenceScore: %s | totalReports(90d): %s | lastReportedAt: %s"
                 % (score, reports, last or "—")
@@ -1663,6 +1904,59 @@ else:
     else:
         suggestion = "待复核：" + (other_reviews[0] if other_reviews else (review[0] if review else "需要人工确认"))
 
+# ---- 六段报告（解锁不改变 留/换，只写入优点/风险）----
+extras = ipr.load_extras(WORKDIR)
+key_status = {
+    "ipinfo_paid": meta.get("key_ipinfo") == "1",
+    "ipregistry": meta.get("key_ipregistry") == "1",
+    "ipapi_is": meta.get("key_ipapi_is") == "1",
+    "ip2location": meta.get("key_ip2location") == "1",
+    "ipqs": meta.get("key_ipqs") == "1",
+    "ipdata": meta.get("key_ipdata") == "1",
+    "dbip": meta.get("key_dbip") == "1",
+}
+# 只有响应里真有付费字段，才把 IPinfo 当付费层
+if key_status["ipinfo_paid"]:
+    _full = (extras.get("ipinfo_full") or {}).get("data") or {}
+    if not (isinstance(_full.get("asn"), dict) or _full.get("privacy") or _full.get("company")):
+        key_status["ipinfo_paid"] = False
+
+mode = meta.get("mode") or "bare"
+proxy_cfg = meta.get("proxy_cfg") or ""
+print("正在查询扩展 DNSBL（DoH）...", file=sys.stderr)
+dnsbl = ipr.run_dnsbl(IP, coffee=sources.get("coffee") or {})
+unlock = ipr.empty_unlock()
+local25 = "仅 VPS 上可测"
+remote25 = "未测（需 --proxy 或在该 IP 的机器上运行）"
+if mode in ("proxy", "local"):
+    print("正在检测出口并跑解锁 / 25 端口...", file=sys.stderr)
+    unlock = ipr.run_unlock(IP, mode, cfg_path=proxy_cfg or None)
+    if mode == "local":
+        local25 = ipr.check_remote25(cfg=None)
+        remote25 = local25
+    elif mode == "proxy":
+        remote25 = ipr.check_remote25(cfg=proxy_cfg or None)
+
+section_report = ipr.build_report({
+    "sources": sources,
+    "extras": extras,
+    "key_status": key_status,
+    "meta": meta,
+    "mode": mode,
+    "unlock": unlock,
+    "local25": local25,
+    "remote25": remote25,
+    "dnsbl": dnsbl,
+})
+ipr.print_report(section_report, color=ipr.want_color())
+_up, _uc = ipr.unlock_pros_cons(unlock)
+for x in _up:
+    if x not in pros:
+        pros.append(x)
+for x in _uc:
+    if x not in cons:
+        cons.append(x)
+
 print()
 print("======== 情况分析 ========")
 print("结论: %s" % conclusion)
@@ -1742,6 +2036,8 @@ summary = {
     "notes": notes[:],
     "pros": pros,
     "cons": cons,
+    "sections": section_report,
+    "mode": mode,
 }
 
 json_path = meta.get("json_path") or ""

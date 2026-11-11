@@ -3,7 +3,7 @@ name: vps-node
 description: Pre-flight a freshly bought VPS (hardware / IP reputation / return route, nothing installed) and only then provision a production-ready proxy node — sing-box (VLESS+REALITY :443 + Hysteria2 :8443), BBR tuning, DuckDNS + Let's Encrypt HTTPS subscription endpoint, security hardening (ufw/SSH/sysctl/fail2ban), and a 9-source external IP reputation audit. Use when the user buys a new VPS, wants to set up a 节点/机场/梯子, replace a residential proxy node, or asks to harden + audit a VPS.
 description_zh: "新 VPS 上线全流程：先验货（硬件/IP 质量/回程，不装机）→ sing-box 双协议节点 + BBR + 免费域名 HTTPS 订阅 + 安全加固 + IP 风险体检 → 验收 → 服务端哨兵"
 description_en: "One-shot VPS node deployment: sing-box dual protocol, BBR, HTTPS subscription via DuckDNS+LE, hardening, IP reputation audit"
-version: 1.12.0
+version: 1.13.0
 allowed-tools: Read,Write,Edit,Bash
 display_name: "VPS 节点上线"
 visibility: "public"
@@ -417,7 +417,7 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 
 | 时机 | 你手上有什么 | 用什么 | 能测到 |
 |---|---|---|---|
-| **购买前** | 只有一个**裸 IP**（试用、别人给的、还没买） | `ip-check-lite.sh <IP>` | 归属 / 类型投票 / 风险标志 / 原生或广播 / **DNSBL（coffee 服务端查询）** / 可选 AbuseIPDB。源：ipinfo、IPLogs、Scamalytics、ip.net.coffee、ipx.al、iping.cc，（可选）AbuseIPDB |
+| **购买前** | 只有一个**裸 IP**（试用、别人给的、还没买） | `ip-check-lite.sh <IP>` | 六段报告（基础信息、类型属性、风险评分、风险因子、解锁、邮局/黑名单）+ 留/换分析。一至四段与黑名单为裸 IP 查询；解锁和远端 25 需 `--proxy` 或在该 IP 的机器上 `--local`。源：ipinfo、IPLogs、Scamalytics、ip.net.coffee、ipx.al、iping.cc、ipwho.is、ip2location.io 免费层、DB-IP 免费层、ipapi.is 免费层；可选 key 见下 |
 | **购买后·情况一** | **代理型 IP**：有 socks5/http 凭据，IP 未配进任何机器 | `ip-audit.sh --proxy 'socks5h://user:pass@host:port' --expect <IP> [--node <别名>]` | 全六节（含流媒体/AI 解锁、423 库黑名单、IPQS） |
 | **购买后·情况二** | **纯 VPS**：有 SSH | `ip-audit.sh --vps-ip <IP> --vps-port <端口>` | 全六节 |
 | 已配进本 skill 的出站 | 凭据别名 + egress 名 | `ip-audit.sh --node <别名> --egress us1` | 全六节（凭据从 VPS 侧解析，不落本地明文） |
@@ -438,7 +438,26 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 | AbuseIPDB（可选，需免费 key） | score < 25 且 90 天举报 < 5 | score ≥ 25 或 90 天举报 ≥ 5 | score ≥ 75 |
 | IPQS（仅全量 `ip-audit.sh`） | 0–10 | 11–75 | > 75（「可疑」档） |
 
-`ip-check-lite.sh` 退出码：0 = 通过（**留**）；1 = 需人工复核（**待复核**）；3 = 放弃（**换**）；2 = 参数错误。任一启用源超时、被拦、解析失败，都至少判复核（fail-closed）。过了快查再花钱/花时间跑全量。
+`ip-check-lite.sh` 退出码：0 = 通过（**留**）；1 = 需人工复核（**待复核**）；3 = 放弃（**换**）；2 = 参数错误。核心源（ipinfo / IPLogs / Scamalytics / coffee / ipx / iping）超时、被拦、解析失败，都至少判复核（fail-closed）。补充源失败只显示「—」，不单独拉高复核。过了快查再花钱/花时间跑全量。
+
+报告按六段输出（格式对齐常见的 IPQuality 体检），随后是原来的「情况分析」（结论、综合分、优点/风险、建议）。需要 key 的库（IPinfo 类型/privacy、ipregistry、ipapi.is 完整字段、IP2Location usage_type、IPQS、ipdata、AbuseIPDB）没有对应环境变量时显示**未配置**，不会编造数据。可选变量：`IPINFO_TOKEN`、`IPREGISTRY_KEY`、`IPAPI_IS_KEY`、`IP2LOCATION_KEY`、`IPQS_KEY`、`IPDATA_KEY`、`DBIP_API_KEY`、`ABUSEIPDB_KEY`（或 `~/.vps-node/abuseipdb.key`）。key 经 curl `--config` 传递，不写进日志或命令行。
+
+解锁与远端 25 端口必须从目标 IP 出站：
+
+```bash
+# 仅裸 IP（一至四段 + 黑名单；五、六段解锁/远端25 显示未测）
+bash scripts/ip-check-lite.sh <IP>
+
+# 经该 IP 的 SOCKS/HTTP 代理测解锁和远端 25（凭证不会打印）
+bash scripts/ip-check-lite.sh --proxy socks5h://user:pass@host:1080 <IP>
+bash scripts/ip-check-lite.sh --proxy http://host:8080 <IP>
+
+# 已经在这台 VPS / 该出口的机器上
+bash scripts/ip-check-lite.sh --local          # 自动探测出口 IP
+bash scripts/ip-check-lite.sh --local <IP>    # 若本机出口与 <IP> 不符会标「不匹配」
+```
+
+解锁结果只写入优点/风险，**不改变** 留/换结论。ChatGPT / Reddit 等被屏蔽会列为风险。本机 stdout 是终端时会着色，可用 `NO_COLOR=1` 关掉。
 
 每次快查结束会打印「情况分析」：结论（留 / 换 / 待复核）、0–100 综合分（类型投票、主流运营商加分、代理标志、Scamalytics、原生/广播、DNSBL、rDNS、源完整性；AbuseIPDB 有结果时再加减），以及优点、风险和一句建议。待复核会写明原因：仅当完全没有实际信号时才写「仅检测源失败」；否则先列出实际信号（例如有 N 个源判机房、代理/VPN 标记），检测源失败只作为补充。机器可读摘要写在 `~/.vps-node/ipaudits/<IP>/lite-<stamp>.json`（权限 600），不含密钥。
 
@@ -474,7 +493,7 @@ install -m 600 /dev/null ~/.vps-node/abuseipdb.key
 
 ### 三条硬规矩
 
-- **本机直接做 DNSBL 查询会失真**：Mac 走 Clash TUN 的 fake-ip（198.18.x）时，本地 DNSBL 结果不可信。所以 `ip-audit.sh --proxy` 默认经 VPS 转发执行，`--local` 只作应急。**例外**：`ip-check-lite.sh` 用的是 ip.net.coffee 的服务端 DNSBL API，查询发生在对方服务器上，购买前体检可以信；其中 Spamhaus PBL（`127.0.0.10` / `11`）是家宽段常见策略名单，不代表这个 IP 脏
+- **本机直接做 DNSBL 查询会失真**：Mac 走 Clash TUN 的 fake-ip（198.18.x）时，本地 DNSBL 结果不可信。所以 `ip-audit.sh --proxy` 默认经 VPS 转发执行，`--local` 只作应急。**例外**：`ip-check-lite.sh` 的黑名单同时用 ip.net.coffee 服务端 API，以及经 DoH（dns.google）查约 40 家常见名单，以避开本机 Clash fake-ip；Spamhaus 对部分公共解析器会返回拒绝码，这些不计入「有效」。PBL（`127.0.0.10` / `11`）及同类策略名单记为「已标记」，不代表这个 IP 脏
 - **`--expect` 不要省**：同一商家多条 IP 时极易搞混（实测出现过两条 IP 只差最后一位、端口还不同的情况），出口 echo 不等于期望值就中止，避免把 A 的报告当成 B 的
 - **报告公开且不可撤回**：`Report.Check.Place` 只露掩码 IP / ASN / 评分，不含完整 IP，但没有删除接口。本地留档在 `~/.vps-node/ipaudits/<出口IP>/`
 
@@ -530,9 +549,11 @@ scp -P <SSH_PORT> scripts/vps-harden.sh root@<IP>:/root/ && ssh -p <SSH_PORT> ro
 bash scripts/vps-external-ip-check.sh <IP> 443
 
 # ---- IP 体检三阶段（详见「IP 体检」一节）----
-# 购买前：裸 IP 快查（ipinfo / IPLogs / Scamalytics / coffee / ipx.al / iping，可选 AbuseIPDB）
+# 购买前：裸 IP 快查（六段报告 + 留/换分析）
 bash scripts/ip-check-lite.sh <IP>
-# 比较多次快查结果，看哪条更值得留
+bash scripts/ip-check-lite.sh --proxy socks5h://host:1080 <IP>
+bash scripts/ip-check-lite.sh --local
+# 比较多次快查结果（含六段汇总），看哪条更值得留
 bash scripts/ip-compare.sh <IP1> <IP2> <IP3>
 bash scripts/ip-compare.sh --all
 bash scripts/ip-compare.sh --mask --rerun <IP1> <IP2>
