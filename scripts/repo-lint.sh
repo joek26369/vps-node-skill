@@ -11,6 +11,8 @@
 #   - CI 里只能跑「通用规则」（IPv4 / 家目录 / 邮箱），不能把个人值写进仓库。
 #   - 个人专属的敏感词放在 .github/sensitive-blocklist.local.txt（已 gitignore），
 #     本地跑时自动加载，CI 里不存在该文件就自动跳过。
+#   - 另扫 token / 密钥形态（UUID、部分打码的 UUID、私钥头、常见 API key、
+#     token=/password= 后跟非占位符的字面量）；本机装了 gitleaks 会顺带跑一遍。
 #   - 某行若确实需要保留（例如文档里的示例），在该行末尾加 `# lint-allow`
 #     即可放行。
 
@@ -32,13 +34,11 @@ note() { if [ "$VERBOSE" = 1 ]; then printf '  \033[2m· %s\033[0m\n' "$*"; fi; 
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   FILE_LIST=$(git ls-files)
 else
-  FILE_LIST=$(find . -type f ! -path './.git/*' ! -path './.workbuddy/*' | sed 's|^\./||')
+  FILE_LIST=$(find . -type f ! -path './.git/*' ! -path './.workbuddy/*' ! -name '._*' ! -name '.DS_Store' | sed 's|^\./||')
 fi
 
-# 文本类文件才做内容扫描
-TEXT_EXTS='sh|py|md|json|yml|yaml|txt|conf|service|command|toml'
 
-echo "== 1/3 shell 语法 =="
+echo "== 1/4 shell 语法 =="
 n=0
 while IFS= read -r f; do
   [ -z "$f" ] && continue
@@ -60,7 +60,7 @@ else
   pass "$n 个 shell 脚本语法通过"
 fi
 
-echo "== 2/3 python 语法 =="
+echo "== 2/4 python 语法 =="
 PY_FILES=""
 while IFS= read -r f; do
   case "$f" in *.py) PY_FILES="$PY_FILES $f" ;; esac
@@ -88,12 +88,11 @@ PY
   fi
 fi
 
-echo "== 3/3 敏感值扫描 =="
+echo "== 3/4 敏感值扫描 =="
 
 # 通用规则：命中的行进入二次判定，避免误报
 scan_rule() {
-  rule_name="$1"
-  pattern="$2"
+  pattern="$2"   # $1 = 规则名，仅作调用处的可读标注
   while IFS= read -r f; do
     [ -z "$f" ] && continue
     case "$f" in
@@ -188,6 +187,28 @@ else
   pass "无邮箱"
 fi
 
+# token / 密钥形态
+#   全 0 的 UUID 与 <PLACEHOLDER>/CHANGE_ME/YOUR_ 之类占位符放行
+TOKEN_RE='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+TOKEN_RE="$TOKEN_RE"'|[0-9a-fA-F]{6,}-\.\.\.|\.\.\.-[0-9a-fA-F]{4}-[0-9a-fA-F]{8,}'
+TOKEN_RE="$TOKEN_RE"'|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+TOKEN_RE="$TOKEN_RE"'|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}'
+TOKEN_RE="$TOKEN_RE"'|(token|passw(or)?d|secret|api[_-]?key)["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9+/_=-]{16,}'
+TOK_HITS=$(scan_rule token "$TOKEN_RE")
+TOK_BAD=0
+if [ -n "$TOK_HITS" ]; then
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case "$line" in *lint-allow*) note "allow: $line"; continue ;; esac
+    case "$line" in
+      *00000000-0000-0000-0000-000000000000*) note "placeholder: $line"; continue ;;
+    esac
+    fail "疑似 token/密钥：${line%%$'\t'*}:$(printf '%s' "${line#*$'\t'}" | cut -d: -f1)（内容不回显）"
+    TOK_BAD=$((TOK_BAD + 1))
+  done <<< "$TOK_HITS"
+fi
+[ "$TOK_BAD" -eq 0 ] && pass "无 token / 密钥形态字面量"
+
 # 本地私有黑名单（不提交）
 BL=".github/sensitive-blocklist.local.txt"
 if [ -f "$BL" ]; then
@@ -209,6 +230,20 @@ if [ -f "$BL" ]; then
   pass "私有黑名单 $c 条已检查"
 else
   note "无 ${BL}，跳过私有黑名单"
+fi
+
+echo "== 4/4 gitleaks =="
+if command -v gitleaks >/dev/null 2>&1; then
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    GL_OUT=$(gitleaks git --no-banner --redact . 2>&1); GL_RC=$?
+  else
+    GL_OUT=$(gitleaks dir --no-banner --redact . 2>&1); GL_RC=$?
+  fi
+  if [ "$GL_RC" -eq 0 ]; then pass "gitleaks 无发现"
+  else fail "gitleaks 有发现（已 --redact）"; printf '%s\n' "$GL_OUT" | tail -20 | sed 's/^/      /'; fi
+else
+  note "本机未装 gitleaks，跳过（CI 会跑）"
+  pass "gitleaks 跳过（未安装；CI 中执行）"
 fi
 
 echo
