@@ -9,6 +9,8 @@ import socket
 import subprocess
 import sys
 import time
+from datetime import datetime
+from pathlib import Path
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -262,11 +264,19 @@ def _rev(ip):
     return ".".join(reversed(ip.split(".")))
 
 
-def _doh_a(name, timeout=6):
-    url = "https://dns.google/resolve?name=%s&type=A" % name
+def _doh_query(name, typ, timeout=6):
+    """Query dns.google DoH. typ is A or PTR. Avoids Clash fake-ip on the box resolver."""
+    try:
+        from urllib.parse import quote
+        qn = quote(name, safe=".-")
+    except Exception:
+        qn = name
+    url = "https://dns.google/resolve?name=%s&type=%s" % (qn, typ)
+    want = 1 if typ.upper() == "A" else (12 if typ.upper() == "PTR" else None)
     try:
         p = subprocess.run(
-            ["curl", "-sS", "--max-time", str(timeout), url],
+            ["curl", "-sS", "--max-time", str(timeout),
+             "-H", "Accept: application/dns-json", url],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout + 2,
         )
         if p.returncode != 0 or not p.stdout:
@@ -274,8 +284,11 @@ def _doh_a(name, timeout=6):
         data = json.loads(p.stdout.decode("utf-8", "replace"))
         answers = []
         for a in data.get("Answer") or []:
-            if a.get("type") == 1 and a.get("data"):
-                answers.append(str(a["data"]).strip())
+            if want is not None and a.get("type") != want:
+                continue
+            val = str(a.get("data") or "").strip().rstrip(".")
+            if val:
+                answers.append(val)
         if answers:
             return answers, "ok"
         if data.get("Status") == 3:
@@ -284,6 +297,648 @@ def _doh_a(name, timeout=6):
     except Exception:
         return None, "error"
 
+
+def _doh_a(name, timeout=6):
+    return _doh_query(name, "A", timeout=timeout)
+
+
+def _doh_ptr(name, timeout=6):
+    return _doh_query(name, "PTR", timeout=timeout)
+
+
+# ----- 硬证据：登记库 (RDAP/whois) 与 rDNS (DoH PTR + FCrDNS) -----
+# 这不是第三方类型库，而是注册局与 DNS 本身的记录。
+
+RES_PTR_RE = re.compile(
+    r"(hsd\d*\.|fios|sbcglobal|lightspeed|\.att\.net|phones\.att\.net|"
+    r"res\.spectrum\.com|\.rr\.com|res\.rr|charter\.|spectrum\.com|"
+    r"\.cox\.net|\.cox\.com|wavecable|wavebroadband|"
+    r"comcast\.net|xfinity|"
+    r"(?:pool-|static-|dsl-).+\.verizon\.net|(?:east|west)\.verizon\.net|myvzw|"
+    r"\bdyn\b|dhcp|\bdsl\b|adsl|cable|fiber|fibre|\bres\b|resid|"
+    r"\bpool\b|\bcpe\b|pppoe|frontier|centurylink|qwest|"
+    r"shawcable|rogers|videotron|telus|\bbt\.net|virginmedia|skybroadband|"
+    r"t-online|wanadoo|optimum|suddenlink|\brcn\.|mediacom|wideopenwest)",
+    re.I,
+)
+BIZ_PTR_RE = re.compile(r"comcastbusiness|uu\.net|alter\.net", re.I)
+HOST_PTR_RE = re.compile(
+    r"(vps|hosting|dedicated|colocation|\bcolo\b|datacenter|data-center|"
+    r"digitalocean|linode|hetzner|vultr|contabo|\bovh\b|amazonaws|"
+    r"googleusercontent|cloudapp|azure|akamai|leaseweb|hivelocity|"
+    r"ip-\d+-\d+-\d+-\d+)",
+    re.I,
+)
+HOST_PTR_WEAK_RE = re.compile(r"(\bstatic\b|\bcloud\b|\bserver\b)", re.I)
+
+HOST_ORG_RE = re.compile(
+    r"hosting|data\s*cent(?:er|re)|datacenter|data-center|\bcloud\b|\bvps\b|"
+    r"\bproxy\b|netlab|\bcolo(?:cation)?\b|ipxo|ip-?rent|\bip rent\b|"
+    r"\bleasing\b|\bleased?\b|leaseweb|serverfarm|dedicated\s*server|"
+    r"ip\s*transit\s*reseller|prefix\s*lease",
+    re.I,
+)
+LEASE_RE = re.compile(
+    r"\bipxo\b|\bleased?\b|\bleasing\b|address[^\n]{0,40}rent|rented\s+to|"
+    r"sub-allocat(?:ed|ion)[^\n]{0,40}leas",
+    re.I,
+)
+ISP_ORG_RE = re.compile(
+    r"\bcomcast\b|xfinity|\bcharter\b|\bspectrum\b|\bverizon\b|\bfios\b|"
+    r"\bat&?t\b|sbcglobal|\bcox\b|wavecable|wave\s*g?\.?\s*broadband|wavecom|"
+    r"bam\s*broadband|\bfrontier\b|centurylink|\bqwest\b|windstream|"
+    r"\boptimum\b|suddenlink|\brcn\b|mediacom|wideopenwest|\bwow\b|"
+    r"\brogers\b|\bshaw\b|\btelus\b|\bbell\b|virgin\s*media|\bsky\b|"
+    r"t-mobile|deutsche\s*telekom|\bvodafone\b|\borange\b|\bbt\b|"
+    r"telefonica|telstra|softbank|ntt\s*docomo|kddi",
+    re.I,
+)
+CARRIER_ORG_RE = re.compile(
+    r"\bgtt\b|\bcogent\b|level\s*3|\blumen\b|hurricane|he\.net|"
+    r"\bntt\b|\btata\b|\bzayo\b|above\.net|\buunet\b|\btelia\b|pccw|"
+    r"megapath",
+    re.I,
+)
+COUNTRY_MAP = {
+    "united states": "US", "usa": "US", "u.s.a.": "US", "u.s.": "US",
+    "united kingdom": "GB", "great britain": "GB", "canada": "CA",
+    "germany": "DE", "france": "FR", "netherlands": "NL", "japan": "JP",
+    "australia": "AU", "china": "CN", "hong kong": "HK", "singapore": "SG",
+    "ireland": "IE", "switzerland": "CH", "sweden": "SE", "brazil": "BR",
+    "india": "IN", "korea": "KR", "south korea": "KR", "bulgaria": "BG",
+}
+
+ALLOC_ZH = {
+    "direct allocation": "直接分配",
+    "direct assignment": "直接指派",
+    "allocation": "分配",
+    "assignment": "指派",
+    "reallocated": "再分配",
+    "reassignment": "转分配",
+    "reassigned": "转分配",
+    "allocated pa": "PA 分配",
+    "allocated pi": "PI 分配",
+    "assigned pa": "PA 指派",
+    "assigned pi": "PI 指派",
+    "sub-allocated pa": "PA 再分配",
+    "legacy": "历史分配",
+}
+
+
+def classify_ptr(hostname):
+    """Return (style, style_zh) where style is res|host|host_weak|other|none."""
+    if not hostname or hostname in ("?", "(无)", "null", "None"):
+        return "none", "无 PTR"
+    h = hostname.strip().rstrip(".")
+    if not h:
+        return "none", "无 PTR"
+    if BIZ_PTR_RE.search(h):
+        return "other", "商业线风格"
+    res = bool(RES_PTR_RE.search(h))
+    host_strong = bool(HOST_PTR_RE.search(h))
+    host_weak = bool(HOST_PTR_WEAK_RE.search(h))
+    if res and not host_strong:
+        return "res", "家宽风格"
+    if host_strong and not res:
+        return "host", "服务器风格"
+    if res and host_strong:
+        return "other", "混合风格"
+    if host_weak and not res:
+        return "host_weak", "弱服务器风格"
+    return "other", "其他"
+
+
+def lookup_rdns(ip, timeout=6):
+    """PTR via DoH + forward-confirm. Never uses the box stub resolver."""
+    out = {
+        "ptr": None, "ptrs": [], "fcrdns": False,
+        "style": "none", "style_zh": "无 PTR", "error": None, "a_records": [],
+    }
+    if not ip or not re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", ip):
+        out["error"] = "bad_ip"
+        return out
+    rev = ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
+    ptrs, st = _doh_ptr(rev, timeout=timeout)
+    if st in ("doh_fail", "error") or ptrs is None:
+        out["error"] = st or "doh_fail"
+        out["style_zh"] = "—"
+        out["style"] = "unknown"
+        return out
+    if not ptrs:
+        return out
+    out["ptrs"] = ptrs
+    out["ptr"] = ptrs[0]
+    style, zh = classify_ptr(ptrs[0])
+    out["style"], out["style_zh"] = style, zh
+    addrs, ast = _doh_a(ptrs[0], timeout=timeout)
+    out["a_records"] = addrs or []
+    out["fcrdns"] = bool(addrs) and ip in addrs
+    return out
+
+
+def _vcard_fn(ent):
+    v = ent.get("vcardArray")
+    fn = org = adr_label = country = None
+    if isinstance(v, list) and len(v) >= 2 and isinstance(v[1], list):
+        for item in v[1]:
+            if not item or not isinstance(item, (list, tuple)):
+                continue
+            key = item[0]
+            val = item[3] if len(item) > 3 else None
+            params = item[1] if len(item) > 1 and isinstance(item[1], dict) else {}
+            if key == "fn" and val:
+                fn = val if isinstance(val, str) else (val[0] if val else None)
+            elif key == "org" and val:
+                if isinstance(val, list):
+                    org = " ".join(str(x) for x in val if x)
+                else:
+                    org = val
+            elif key == "adr":
+                if params.get("label"):
+                    adr_label = params["label"]
+                elif isinstance(val, list):
+                    adr_label = "\n".join(str(x) for x in val if x)
+            elif key in ("cc", "country"):
+                country = val
+    return fn, org, adr_label, country
+
+
+def _country_from_text(text):
+    if not text:
+        return None
+    lines = [x.strip() for x in re.split(r"[\n,;]+", str(text)) if x and x.strip()]
+    if not lines:
+        return None
+    last = lines[-1]
+    if re.fullmatch(r"[A-Za-z]{2}", last):
+        return last.upper()
+    return COUNTRY_MAP.get(last.lower()) or (last if len(last) <= 32 else None)
+
+
+def _iter_entities(ents, depth=0):
+    for ent in ents or []:
+        yield depth, ent
+        for item in _iter_entities(ent.get("entities") or [], depth + 1):
+            yield item
+
+
+def _cidr_from_range(start, end):
+    import socket as _socket
+    import struct
+    import math
+    try:
+        a = struct.unpack("!I", _socket.inet_aton(start))[0]
+        b = struct.unpack("!I", _socket.inet_aton(end))[0]
+        if a > b:
+            a, b = b, a
+        span = b - a + 1
+        if span <= 0 or (span & (span - 1)) != 0:
+            return "%s - %s" % (start, end)
+        length = 32 - int(math.log2(span))
+        return "%s/%d" % (_socket.inet_ntoa(struct.pack("!I", a)), length)
+    except Exception:
+        if start and end:
+            return "%s - %s" % (start, end)
+        return start or end
+
+
+def _date_only(s):
+    if not s:
+        return None
+    raw = str(s).strip()
+    try:
+        t = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is not None:
+            try:
+                from zoneinfo import ZoneInfo
+                dt = dt.astimezone(ZoneInfo("America/New_York"))
+            except Exception:
+                pass
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        m = re.match(r"(\d{4}-\d{2}-\d{2})", raw)
+        return m.group(1) if m else None
+
+
+def parse_rdap(data):
+    if not isinstance(data, dict) or not data:
+        return None
+    if not any(data.get(k) for k in ("handle", "startAddress", "cidr0_cidrs", "inetnum", "name", "objectClassName")):
+        return None
+    cidrs = []
+    for c in data.get("cidr0_cidrs") or []:
+        if isinstance(c, dict) and c.get("v4prefix") is not None and c.get("length") is not None:
+            cidrs.append("%s/%s" % (c["v4prefix"], c["length"]))
+        elif isinstance(c, str):
+            cidrs.append(c)
+    if not cidrs and data.get("cidr"):
+        c = data.get("cidr")
+        if isinstance(c, list):
+            cidrs.extend(str(x) for x in c)
+        else:
+            cidrs.append(str(c))
+    start, end = data.get("startAddress"), data.get("endAddress")
+    if not cidrs and start:
+        cidrs.append(_cidr_from_range(start, end or start))
+    prefix_len = None
+    for c in cidrs:
+        m = re.search(r"/(\d+)$", c)
+        if m:
+            n = int(m.group(1))
+            if prefix_len is None or n > prefix_len:
+                prefix_len = n
+
+    orgs = []
+    countries = []
+    if data.get("country"):
+        countries.append(_country_from_text(data["country"]) or str(data["country"]).upper())
+    for depth, ent in _iter_entities(data.get("entities") or []):
+        fn, org, adr, cc = _vcard_fn(ent)
+        roles = [str(x).lower() for x in (ent.get("roles") or [])]
+        name = fn or org
+        if name:
+            orgs.append({"name": name, "roles": roles, "handle": ent.get("handle"), "depth": depth})
+        if cc:
+            countries.append(_country_from_text(cc) or str(cc))
+        if adr:
+            ctry = _country_from_text(adr)
+            if ctry:
+                countries.append(ctry)
+
+    def _pick_org():
+        for role in ("registrant", "administrative"):
+            for o in orgs:
+                if role in (o.get("roles") or []):
+                    return o.get("name")
+        return orgs[0]["name"] if orgs else None
+
+    ev = {}
+    for e in data.get("events") or []:
+        act = (e.get("eventAction") or "").lower().replace(" ", "")
+        dt = _date_only(e.get("eventDate"))
+        if not dt:
+            continue
+        if act in ("registration", "registered", "lastchanged", "expiration"):
+            ev[act] = dt
+        elif "registr" in act:
+            ev.setdefault("registration", dt)
+        elif "chang" in act or "updat" in act:
+            ev.setdefault("lastchanged", dt)
+
+    remarks = []
+    for r in data.get("remarks") or []:
+        desc = r.get("description")
+        if isinstance(desc, list):
+            remarks.append(" ".join(str(x) for x in desc))
+        elif desc:
+            remarks.append(str(desc))
+        elif r.get("title"):
+            remarks.append(str(r["title"]))
+
+    port43 = (data.get("port43") or "").lower()
+    rir = None
+    if "arin" in port43:
+        rir = "ARIN"
+    elif "ripe" in port43:
+        rir = "RIPE"
+    elif "apnic" in port43:
+        rir = "APNIC"
+    elif "lacnic" in port43:
+        rir = "LACNIC"
+    elif "afrinic" in port43:
+        rir = "AFRINIC"
+    if not rir:
+        blob = " ".join(str(l.get("href") or "") for l in (data.get("links") or []))
+        for name, key in (("ARIN", "arin"), ("RIPE", "ripe"), ("APNIC", "apnic"),
+                          ("LACNIC", "lacnic"), ("AFRINIC", "afrinic")):
+            if key in blob.lower():
+                rir = name
+                break
+
+    typ = data.get("type") or data.get("status")
+    if isinstance(typ, list):
+        typ = ", ".join(str(x) for x in typ)
+    typ_s = str(typ).strip() if typ else None
+    typ_key = typ_s.lower() if typ_s else ""
+    typ_zh = ALLOC_ZH.get(typ_key) or ALLOC_ZH.get(typ_key.replace("_", " "))
+
+    country = None
+    for c in countries:
+        if c and re.fullmatch(r"[A-Z]{2}", c):
+            country = c
+            break
+    if not country and countries:
+        country = countries[0]
+
+    return {
+        "ok": True,
+        "source": "rdap",
+        "rir": rir,
+        "org": _pick_org(),
+        "orgs": orgs,
+        "netname": data.get("name"),
+        "handle": data.get("handle") or data.get("objectKey") or data.get("inetnum"),
+        "cidr": ", ".join(cidrs) if cidrs else None,
+        "prefix_len": prefix_len,
+        "allocation": typ_s,
+        "allocation_zh": typ_zh,
+        "country": country,
+        "registered": ev.get("registration"),
+        "updated": ev.get("lastchanged"),
+        "remarks": remarks,
+        "start": start,
+        "end": end,
+    }
+
+
+def parse_whois_text(text):
+    if not text or not str(text).strip():
+        return None
+    fields = {}
+    for line in str(text).splitlines():
+        if ":" not in line or line.startswith("%") or line.startswith("#"):
+            continue
+        k, _, v = line.partition(":")
+        k, v = k.strip().lower(), v.strip()
+        if not k or not v:
+            continue
+        fields.setdefault(k, v)
+
+    def first(*keys):
+        for k in keys:
+            if fields.get(k):
+                return fields[k]
+        return None
+
+    org = first("org-name", "orgname", "organization", "organisation", "owner", "descr")
+    netname = first("netname", "net name")
+    handle = first("netrange", "net handle", "nethandle", "inetnum")
+    cidr = first("cidr", "route")
+    typ = first("nettype", "net type", "status")
+    country = first("country")
+    if country:
+        country = _country_from_text(country) or country.upper()[:2]
+    reg = _date_only(first("regdate", "reg date", "created"))
+    upd = _date_only(first("updated", "last-modified", "changed"))
+    typ_s = typ
+    typ_zh = ALLOC_ZH.get((typ or "").lower()) if typ else None
+    remarks = []
+    for k, v in fields.items():
+        if "comment" in k or "remark" in k:
+            remarks.append(v)
+    prefix_len = None
+    if cidr and "/" in cidr:
+        try:
+            prefix_len = max(int(x.split("/")[-1]) for x in re.findall(r"\S+/\d+", cidr))
+        except ValueError:
+            pass
+    return {
+        "ok": True,
+        "source": "whois",
+        "rir": None,
+        "org": org,
+        "orgs": [{"name": org, "roles": ["registrant"]}] if org else [],
+        "netname": netname,
+        "handle": handle,
+        "cidr": cidr,
+        "prefix_len": prefix_len,
+        "allocation": typ_s,
+        "allocation_zh": typ_zh,
+        "country": country,
+        "registered": reg,
+        "updated": upd,
+        "remarks": remarks,
+    }
+
+
+def load_registry(workdir):
+    data = read_json_body(workdir, "rdap")
+    parsed = parse_rdap(data) if data else None
+    srcf = Path(workdir) / "rdap.source"
+    if parsed and srcf.is_file():
+        try:
+            parsed["rdap_endpoint"] = srcf.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            pass
+    if parsed:
+        return parsed
+    whois_path = Path(workdir) / "whois.body"
+    if whois_path.is_file():
+        try:
+            text = whois_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        parsed = parse_whois_text(text)
+        if parsed:
+            return parsed
+    return {
+        "ok": False, "source": None, "org": None, "netname": None, "handle": None,
+        "cidr": None, "allocation": None, "allocation_zh": None, "country": None,
+        "registered": None, "updated": None, "remarks": [], "prefix_len": None,
+        "error": "rdap_unavailable",
+    }
+
+
+def _norm_org(s):
+    s = str(s or "").lower()
+    s = re.sub(
+        r"\b(llc|l\.?l\.?c\.?|inc|incorporated|ltd|limited|corp|corporation|"
+        r"co|communications?|services?|company|holdings?|group|opco|americas?|"
+        r"enterprises?|international|the)\b",
+        " ",
+        s,
+        flags=re.I,
+    )
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return " ".join(s.split())
+
+
+def orgs_match(a, b):
+    na, nb = _norm_org(a), _norm_org(b)
+    if not na or not nb:
+        return False
+    if na == nb or na in nb or nb in na:
+        return True
+    ta = {t for t in na.split() if len(t) >= 3}
+    tb = {t for t in nb.split() if len(t) >= 3}
+    return bool(ta and tb and (ta & tb))
+
+
+KNOWN_ORG_RE = re.compile(
+    r"\bgoogle\b|\bamazon\b|\bmicrosoft\b|\bmeta\b|\bfacebook\b|\bapple\b|"
+    r"cloudflare|akamai|\boracle\b|\bibm\b|\bcisco\b|\btwitter\b|\bx corp\b|"
+    r"\balibaba\b|\btencent\b|\bbaidu\b|\bhuawei\b|\bsamsung\b",
+    re.I,
+)
+
+
+def _is_small_reseller(org):
+    """Foo LLC style generic reseller; do not flag well-known carriers just for LLC."""
+    if not org:
+        return False
+    if ISP_ORG_RE.search(org) or CARRIER_ORG_RE.search(org) or HOST_ORG_RE.search(org) or KNOWN_ORG_RE.search(org):
+        return False
+    words = re.findall(r"[A-Za-z0-9&]+", org)
+    has_llc = bool(re.search(r"\b(llc|l\.l\.c\.|ltd|inc)\b", org, re.I))
+    core = [w for w in words if w.lower() not in ("llc", "l", "c", "ltd", "inc", "the", "and", "of")]
+    return has_llc and 0 < len(core) <= 2
+
+
+def _recent_small(reg, prefix_len, months=36):
+    if not reg or prefix_len is None or prefix_len < 21:
+        return False
+    try:
+        d = datetime.strptime(reg, "%Y-%m-%d")
+        now = datetime.now()
+        return (now - d).days <= months * 31  # default window set at call site
+    except Exception:
+        return False
+
+
+def assess_registry(reg, asn_org=None, operator=None, asn=None, operator_kind=None):
+    """Compare registry org vs ASN/operator. Returns flags + summary bits."""
+    flags = {
+        "consistent_isp": False,
+        "consistent": False,
+        "mismatch": False,
+        "reassigned": False,
+        "hosting_org": False,
+        "small_reseller": False,
+        "leased": False,
+        "recent_small": False,
+        "isp_like": False,
+        "carrier_like": False,
+    }
+    if not reg or not reg.get("ok"):
+        return flags, []
+
+    org = reg.get("org") or ""
+    typ = (reg.get("allocation") or "").lower()
+    remarks = " ".join(reg.get("remarks") or [])
+    flags["isp_like"] = bool(org and ISP_ORG_RE.search(org))
+    flags["carrier_like"] = bool(org and CARRIER_ORG_RE.search(org))
+    flags["hosting_org"] = bool(org and HOST_ORG_RE.search(org))
+    flags["small_reseller"] = _is_small_reseller(org)
+    flags["leased"] = bool(LEASE_RE.search(remarks) or (org and LEASE_RE.search(org)))
+    flags["recent_small"] = _recent_small(reg.get("registered"), reg.get("prefix_len"))
+    flags["reassigned"] = bool(re.search(r"reassign|reallocat|sub-allocat", typ))
+
+    # asn 可能是整数；只用组织名/运营商品牌做匹配，不用纯 ASN 号
+    peers = []
+    for x in (asn_org, operator):
+        if x is None:
+            continue
+        xs = str(x).strip()
+        if xs:
+            peers.append(xs)
+    matched = any(orgs_match(org, p) for p in peers) if org else False
+    flags["consistent"] = bool(matched)
+    flags["consistent_isp"] = bool(
+        flags["consistent"] and flags["isp_like"] and not flags["carrier_like"]
+        and not flags["hosting_org"]
+    )
+    # 商业线（Verizon Business 等）与 ASN 一致也不算偏家宽
+    if (operator_kind == "business") or (org and re.search(r"\bbusiness\b", org, re.I)):
+        flags["consistent_isp"] = False
+    if org and peers and not matched:
+        flags["mismatch"] = True
+
+    bits = []
+    if flags["consistent_isp"]:
+        bits.append("登记单位 %s（ISP）与 ASN 一致" % org)
+    elif flags["consistent"] and org:
+        bits.append("登记单位 %s 与 ASN 一致" % org)
+    elif flags["mismatch"] and org:
+        other = asn_org or operator or ("AS%s" % asn if asn else None) or "—"
+        if flags["reassigned"]:
+            bits.append("登记单位 %s 相对 ASN 组织（%s）为转租/转分配" % (org, other))
+        else:
+            bits.append("登记单位 %s 与 ASN 组织（%s）不一致，可能转租/转分配" % (org, other))
+    elif org:
+        bits.append("登记单位 %s" % org)
+    else:
+        bits.append("登记单位 —")
+
+    if flags["hosting_org"]:
+        bits.append("登记单位像机房/代理/转售")
+    if flags["small_reseller"] and not flags["hosting_org"]:
+        bits.append("登记单位像小型转售 LLC")
+    if flags["leased"]:
+        bits.append("RDAP 备注含租用/IPXO 等租赁标记")
+    if flags["recent_small"]:
+        bits.append("近期登记的较小网段（/%s，%s）" % (reg.get("prefix_len"), reg.get("registered") or "—"))
+    return flags, bits
+
+
+def rdns_score(rdns):
+    """Return (points, detail) for the existing rDNS score slot (max 5)."""
+    if not rdns or rdns.get("style") == "unknown" or rdns.get("error"):
+        return 2, "未测到"
+    style = rdns.get("style") or "none"
+    ptr = rdns.get("ptr") or ""
+    fcr = bool(rdns.get("fcrdns"))
+    if style == "host":
+        return 0, "服务器风格 " + ptr
+    if style == "res":
+        if fcr:
+            return 5, "家宽风格 + FCrDNS " + ptr
+        return 3, "家宽风格（正反向不一致） " + ptr
+    if style == "none":
+        return 1, "无 PTR"
+    if style == "host_weak":
+        return 1, "弱服务器风格 " + (ptr or "")
+    if ptr:
+        extra = " + FCrDNS" if fcr else ""
+        return 2, (rdns.get("style_zh") or "其他") + extra + " " + ptr
+    return 1, "无 PTR"
+
+
+def build_hard_evidence(rdns, registry, flags, bits):
+    summary_parts = list(bits or [])
+    if not rdns or rdns.get("style") in ("none", "unknown") or not rdns.get("ptr"):
+        if rdns and rdns.get("error"):
+            summary_parts.append("rDNS 未测到")
+        else:
+            summary_parts.append("无 PTR")
+    else:
+        piece = "rDNS %s %s" % (rdns.get("style_zh") or "", rdns.get("ptr") or "")
+        if rdns.get("fcrdns"):
+            piece += "（FCrDNS）"
+        elif rdns.get("ptr"):
+            piece += "（正反向不一致）"
+        summary_parts.append(piece.strip())
+    summary = "硬证据: " + "；".join(x for x in summary_parts if x)
+    if flags.get("consistent_isp"):
+        summary += " → 偏家宽(+)"
+    return {
+        "summary": summary,
+        "registry": {
+            "ok": bool(registry and registry.get("ok")),
+            "source": (registry or {}).get("source"),
+            "rir": (registry or {}).get("rir"),
+            "org": (registry or {}).get("org"),
+            "cidr": (registry or {}).get("cidr"),
+            "netname": (registry or {}).get("netname"),
+            "handle": (registry or {}).get("handle"),
+            "allocation": (registry or {}).get("allocation"),
+            "allocation_zh": (registry or {}).get("allocation_zh"),
+            "country": (registry or {}).get("country"),
+            "registered": (registry or {}).get("registered"),
+            "updated": (registry or {}).get("updated"),
+            "prefix_len": (registry or {}).get("prefix_len"),
+            "remarks": (registry or {}).get("remarks") or [],
+        },
+        "flags": flags,
+        "rdns": {
+            "ptr": (rdns or {}).get("ptr"),
+            "ptrs": (rdns or {}).get("ptrs") or [],
+            "fcrdns": bool((rdns or {}).get("fcrdns")),
+            "style": (rdns or {}).get("style"),
+            "style_zh": (rdns or {}).get("style_zh"),
+            "error": (rdns or {}).get("error"),
+        },
+    }
 
 def classify_dnsbl_codes(codes, zone_kind):
     if not codes:
@@ -962,18 +1617,75 @@ def build_mail(mode, local25, remote25, dnsbl):
     return {"local25": local_s, "remote25": remote_s, "dnsbl": dnsbl or {}}
 
 
+def _format_hard_basic(hard):
+    """Flatten hard-evidence into section-1 display fields."""
+    hard = hard or {}
+    reg = hard.get("registry") or {}
+    rdns = hard.get("rdns") or {}
+    flags = hard.get("flags") or {}
+    org = reg.get("org") or "—"
+    parts = []
+    if reg.get("cidr"):
+        parts.append(reg["cidr"])
+    if reg.get("netname"):
+        parts.append(reg["netname"])
+    if reg.get("handle"):
+        parts.append(reg["handle"])
+    net = "  ".join(parts) if parts else "—"
+    alloc = "—"
+    if reg.get("allocation"):
+        alloc = reg["allocation"]
+        if reg.get("allocation_zh"):
+            alloc = "%s（%s）" % (reg["allocation"], reg["allocation_zh"])
+        if flags.get("reassigned") and flags.get("mismatch"):
+            alloc += "；转租/转分配"
+    dates = []
+    if reg.get("registered"):
+        dates.append("登记 %s" % reg["registered"])
+    if reg.get("updated"):
+        dates.append("更新 %s" % reg["updated"])
+    rdns_line = "—"
+    if rdns.get("error") and not rdns.get("ptr"):
+        rdns_line = "—"
+    elif not rdns.get("ptr"):
+        rdns_line = "无 PTR"
+    else:
+        bits = [rdns.get("ptr")]
+        if rdns.get("style_zh"):
+            bits.append(rdns["style_zh"])
+        if rdns.get("fcrdns"):
+            bits.append("FCrDNS")
+        elif rdns.get("ptr"):
+            bits.append("正反向不一致")
+        rdns_line = "，".join(bits)
+    return {
+        "reg_org": org,
+        "reg_net": net,
+        "reg_alloc": alloc,
+        "reg_country": reg.get("country") or "—",
+        "reg_dates": "，".join(dates) if dates else "—",
+        "rdns_line": rdns_line,
+        "hard_summary": hard.get("summary") or "",
+        "hard_evidence": hard,
+    }
+
+
 def build_report(ctx):
     sources = ctx["sources"]
     extras = ctx.get("extras") or {}
     key_status = ctx.get("key_status") or {}
     meta = ctx.get("meta") or {}
+    basic = build_basic(sources, extras, meta)
+    hard = ctx.get("hard") or ctx.get("hard_evidence") or {}
+    basic.update(_format_hard_basic(hard))
     return {
-        "basic": build_basic(sources, extras, meta),
+        "basic": basic,
         "types": build_types(sources, extras, key_status),
         "scores": build_scores(sources, extras, key_status),
         "factors": build_factors(sources, extras, key_status),
         "unlock": ctx.get("unlock") or empty_unlock(),
         "mail": build_mail(ctx.get("mode") or "bare", ctx.get("local25"), ctx.get("remote25"), ctx.get("dnsbl")),
+        "hard_evidence": hard,
     }
 
 
@@ -997,6 +1709,16 @@ def print_report(report, color=False):
     else:
         typ_s = typ
     print("  IP类型：     %s" % typ_s)
+    # 硬证据（登记库 + rDNS）
+    print("  登记单位：   %s" % (b.get("reg_org") or "—"))
+    net = b.get("reg_net") or "—"
+    print("  网段：       %s" % net)
+    print("  分配类型：   %s" % (b.get("reg_alloc") or "—"))
+    print("  登记国家：   %s" % (b.get("reg_country") or "—"))
+    print("  登记/更新：  %s" % (b.get("reg_dates") or "—"))
+    print("  rDNS：       %s" % (b.get("rdns_line") or "—"))
+    if b.get("hard_summary"):
+        print("  硬证据：     %s" % b["hard_summary"].replace("硬证据: ", "", 1))
 
     print()
     print("%s二、IP类型属性%s" % (c.bold, c.reset))
@@ -1094,14 +1816,29 @@ def format_compare_section_tables(rows):
 
     # 1
     lines = []
-    hdr = "| IP | ASN | 组织 | 城市 | 使用地 | 注册地 | 时区 | IP类型 |"
+    hdr = "| IP | ASN | 组织 | 城市 | 使用地 | 注册地 | 时区 | IP类型 | 登记单位 | 分配 | rDNS |"
     for r in rows:
         b = sec(r).get("basic") or {}
-        lines.append("| %s | %s | %s | %s | %s | %s | %s | %s |" % (
+        # 兼容旧 JSON（无硬证据字段）
+        he = (sec(r).get("hard_evidence") or r.get("hard_evidence") or b.get("hard_evidence") or {})
+        if not b.get("reg_org") and he:
+            b = dict(b)
+            b.update(_format_hard_basic(he))
+        lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
             ip_of(r), b.get("asn", "—"), b.get("org", "—"), b.get("city", "—"),
             b.get("usage_country", "—"), b.get("registered_country", "—"),
-            b.get("timezone", "—"), b.get("ip_type", "—")))
+            b.get("timezone", "—"), b.get("ip_type", "—"),
+            b.get("reg_org") or "—", b.get("reg_alloc") or "—", b.get("rdns_line") or "—"))
     add_table("一、基础信息", hdr, lines)
+    # Markdown 里再附硬证据摘要
+    md_lines.append("硬证据摘要：")
+    md_lines.append("")
+    for r in rows:
+        b = sec(r).get("basic") or {}
+        he = (sec(r).get("hard_evidence") or r.get("hard_evidence") or b.get("hard_evidence") or {})
+        sm = b.get("hard_summary") or (he.get("summary") if he else "") or "（无硬证据字段，可能是旧结果）"
+        md_lines.append("- %s：%s" % (ip_of(r), sm))
+    md_lines.append("")
 
     db_order = []
     for r in rows:

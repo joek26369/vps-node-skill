@@ -3,7 +3,7 @@ name: vps-node
 description: Pre-flight a freshly bought VPS (hardware / IP reputation / return route, nothing installed) and only then provision a production-ready proxy node — sing-box (VLESS+REALITY :443 + Hysteria2 :8443), BBR tuning, DuckDNS + Let's Encrypt HTTPS subscription endpoint, security hardening (ufw/SSH/sysctl/fail2ban), and a 9-source external IP reputation audit. Use when the user buys a new VPS, wants to set up a 节点/机场/梯子, replace a residential proxy node, or asks to harden + audit a VPS.
 description_zh: "新 VPS 上线全流程：先验货（硬件/IP 质量/回程，不装机）→ sing-box 双协议节点 + BBR + 免费域名 HTTPS 订阅 + 安全加固 + IP 风险体检 → 验收 → 服务端哨兵"
 description_en: "One-shot VPS node deployment: sing-box dual protocol, BBR, HTTPS subscription via DuckDNS+LE, hardening, IP reputation audit"
-version: 1.13.0
+version: 1.13.1
 allowed-tools: Read,Write,Edit,Bash
 display_name: "VPS 节点上线"
 visibility: "public"
@@ -417,18 +417,20 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 
 | 时机 | 你手上有什么 | 用什么 | 能测到 |
 |---|---|---|---|
-| **购买前** | 只有一个**裸 IP**（试用、别人给的、还没买） | `ip-check-lite.sh <IP>` | 六段报告（基础信息、类型属性、风险评分、风险因子、解锁、邮局/黑名单）+ 留/换分析。一至四段与黑名单为裸 IP 查询；解锁和远端 25 需 `--proxy` 或在该 IP 的机器上 `--local`。源：ipinfo、IPLogs、Scamalytics、ip.net.coffee、ipx.al、iping.cc、ipwho.is、ip2location.io 免费层、DB-IP 免费层、ipapi.is 免费层；可选 key 见下 |
+| **购买前** | 只有一个**裸 IP**（试用、别人给的、还没买） | `ip-check-lite.sh <IP>` | 六段报告（基础信息、类型属性、风险评分、风险因子、解锁、邮局/黑名单）+ 留/换分析。一至四段与黑名单为裸 IP 查询；解锁和远端 25 需 `--proxy` 或在该 IP 的机器上 `--local`。源：ipinfo、IPLogs、Scamalytics、ip.net.coffee、ipx.al、iping.cc、ipwho.is、ip2location.io 免费层、DB-IP 免费层、ipapi.is 免费层；另查 RDAP 登记库与 DoH PTR（硬证据）；可选 key 见下 |
 | **购买后·情况一** | **代理型 IP**：有 socks5/http 凭据，IP 未配进任何机器 | `ip-audit.sh --proxy 'socks5h://user:pass@host:port' --expect <IP> [--node <别名>]` | 全六节（含流媒体/AI 解锁、423 库黑名单、IPQS） |
 | **购买后·情况二** | **纯 VPS**：有 SSH | `ip-audit.sh --vps-ip <IP> --vps-port <端口>` | 全六节 |
 | 已配进本 skill 的出站 | 凭据别名 + egress 名 | `ip-audit.sh --node <别名> --egress us1` | 全六节（凭据从 VPS 侧解析，不落本地明文） |
 
-**购买前能查什么、不能查什么**：类型、代理/VPN 标志、原生或广播、rDNS、以及 DNSBL（经 ip.net.coffee 的服务端 API，不走本机 DNS）都可以在只拿一个裸 IP 时查。第五、六节（TikTok / Netflix / ChatGPT / 25 端口）要真实从该 IP 出去探测，没有出口就没有观测点，这不是脚本限制，是物理限制。
+**购买前能查什么、不能查什么**：类型、代理/VPN 标志、原生或广播、登记库（RDAP）、rDNS（DoH PTR + FCrDNS）、以及 DNSBL（经 ip.net.coffee 的服务端 API 与 DoH，不走本机 DNS）都可以在只拿一个裸 IP 时查。第五、六节（TikTok / Netflix / ChatGPT / 25 端口）要真实从该 IP 出去探测，没有出口就没有观测点，这不是脚本限制，是物理限制。
+
+**硬证据（登记库 + rDNS）怎么读**：这两项来自注册局（ARIN 等 RDAP，失败再试 rdap.org；本机有 `whois` 才回退 CLI）和 DNS 本身，不是 IPinfo / Scamalytics 这类第三方分类库，所以单独列在「一、基础信息」和情况分析的「硬证据」一行。读法：登记单位是 ISP 且与 ASN/运营商一致，加上家宽风格 PTR 且正反向确认（FCrDNS），是偏向家宽的硬证据（+）；没有 PTR 只小幅扣分并记风险；PTR 呈服务器风格（vps/hosting/ip-x-x-x 等）计为 1 票独立机房票（名为 rDNS）；登记单位是机房/代理/转售、RDAP 备注含 IPXO/租用、或网段被转分配给与 ASN 所有者不同的客户，记为风险（情况分析会写「可能转租/转分配」）。近期才登记的较小网段（如 /21 以内、约 24 个月内）只作备注。RDAP/PTR 查询失败显示「—」，不因此 fail-closed。
 
 ### 判定阈值
 
 | 指标 | 通过 | 复核 | 放弃 |
 |---|---|---|---|
-| 类型投票（coffee / ipx.al / iping / IPLogs / Scamalytics Server） | ≥ 2 个独立源判 ISP/家宽，且机房票不成多数 | 家宽票不足 2，或与机房票打平；或机房票 ≥ 2（即使家宽仍占多数，含仅多 1 票，仍复核不放弃） | 机房/IDC 票占多数 |
+| 类型投票（coffee / ipx.al / iping / IPLogs / Scamalytics Server；rDNS 服务器风格计为 1 票独立机房票） | ≥ 2 个独立源判 ISP/家宽，且机房票不成多数 | 家宽票不足 2，或与机房票打平；或机房票 ≥ 2（即使家宽仍占多数，含仅多 1 票，仍复核不放弃） | 机房/IDC 票占多数 |
 | 主流家宽运营商加分（仅 AT&T / Verizon / Comcast） | 加分不是否决。机房票为 0 时计为 +1 家宽票，并让 Scamalytics 11–25 仅作参考 | — | 不覆盖机房多数、代理/VPN/Tor、DNSBL、AbuseIPDB、广播、Fraud Score >25。商业线（Comcast Business、无消费侧证据的 Verizon Business/UUNET 等）不加分；AS701 需 fios 等消费侧证据。移动网加分但标注「移动网络」 |
 | 代理 / VPN / Tor | 全部无 | 单源阳性 | ≥ 2 个源阳性 |
 | Scamalytics Fraud Score | —（≤10 低风险参考） | 11–25 **仅作参考**：类型投票明确为家宽、机房票 < 2 且标志干净时，不单独触发复核。Server=Yes 计为机房票并列入风险 | > 25 |
@@ -459,7 +461,7 @@ bash scripts/ip-check-lite.sh --local <IP>    # 若本机出口与 <IP> 不符�
 
 解锁结果只写入优点/风险，**不改变** 留/换结论。ChatGPT / Reddit 等被屏蔽会列为风险。本机 stdout 是终端时会着色，可用 `NO_COLOR=1` 关掉。
 
-每次快查结束会打印「情况分析」：结论（留 / 换 / 待复核）、0–100 综合分（类型投票、主流运营商加分、代理标志、Scamalytics、原生/广播、DNSBL、rDNS、源完整性；AbuseIPDB 有结果时再加减），以及优点、风险和一句建议。待复核会写明原因：仅当完全没有实际信号时才写「仅检测源失败」；否则先列出实际信号（例如有 N 个源判机房、代理/VPN 标记），检测源失败只作为补充。机器可读摘要写在 `~/.vps-node/ipaudits/<IP>/lite-<stamp>.json`（权限 600），不含密钥。
+每次快查结束会打印「情况分析」：结论（留 / 换 / 待复核）、硬证据一行（登记单位与 ASN 是否一致、rDNS/FCrDNS）、0–100 综合分（类型投票、主流运营商加分、代理标志、Scamalytics、原生/广播、DNSBL、rDNS、源完整性；AbuseIPDB 有结果时再加减），以及优点、风险和一句建议。家宽风格 + FCrDNS 占满 rDNS 分；无 PTR 小幅扣分。待复核会写明原因：仅当完全没有实际信号时才写「仅检测源失败」；否则先列出实际信号（例如有 N 个源判机房、代理/VPN 标记），检测源失败只作为补充。机器可读摘要写在 `~/.vps-node/ipaudits/<IP>/lite-<stamp>.json`（权限 600），不含密钥。
 
 测了多条 IP 之后，用 `ip-compare.sh` 做整体比较，看哪条更值得留：
 

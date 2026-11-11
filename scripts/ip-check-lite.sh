@@ -8,6 +8,8 @@
 #   bash ip-check-lite.sh --local [IPv4]    # 在该 IP 的机器上跑，测解锁与 25 端口
 # 一至四段为裸 IP 查询；五、六段（解锁 / 远端 25）需要 --proxy 或 --local。
 # 黑名单在裸 IP 下也会查（DoH + coffee 服务端）。
+# 硬证据：RDAP（登记单位/网段/分配类型）与 DoH PTR + FCrDNS；失败不 fail-closed。
+# 服务器风格 PTR 计为独立机房票（rDNS）；无 PTR 小幅扣分。
 # 需要 key 的库（IPQS / ipregistry / ipdata / IP2Location 类型 / ipapi 完整字段）
 # 仅当对应环境变量存在时才查询，key 走 curl --config，不写日志、不进 argv。
 #
@@ -444,6 +446,34 @@ _e4=$!
 for _p in "$_e1" "$_e2" "$_e3" "$_e4"; do
   wait "$_p" || true
 done
+
+# RDAP（先 ARIN，失败再 rdap.org 引导；都失败且本机有 whois 才回退）
+# 这是补充硬证据，失败不 fail-closed。
+fetch_one rdap "https://rdap.arin.net/registry/ip/${IP}" 15
+_rdap_code=$(tr -d '[:space:]' < "$WORKDIR/rdap.code" 2>/dev/null || printf '000')
+_rdap_ok=0
+if [ "$_rdap_code" = 200 ] && grep -Eq '"handle"|"startAddress"|"cidr0_cidrs"|"inetnum"|"objectClassName"' "$WORKDIR/rdap.body" 2>/dev/null; then
+  _rdap_ok=1
+  printf 'arin
+' > "$WORKDIR/rdap.source"
+fi
+if [ "$_rdap_ok" != 1 ]; then
+  fetch_one rdap "https://rdap.org/ip/${IP}" 15
+  _rdap_code=$(tr -d '[:space:]' < "$WORKDIR/rdap.code" 2>/dev/null || printf '000')
+  if [ "$_rdap_code" = 200 ] && grep -Eq '"handle"|"startAddress"|"cidr0_cidrs"|"inetnum"|"objectClassName"' "$WORKDIR/rdap.body" 2>/dev/null; then
+    _rdap_ok=1
+    printf 'rdap.org
+' > "$WORKDIR/rdap.source"
+  fi
+fi
+if [ "$_rdap_ok" != 1 ] && command -v whois >/dev/null 2>&1; then
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 15 whois "$IP" > "$WORKDIR/whois.body" 2>"$WORKDIR/whois.err" || true
+  else
+    whois "$IP" > "$WORKDIR/whois.body" 2>"$WORKDIR/whois.err" || true
+  fi
+fi
+unset _rdap_code _rdap_ok
 
 # 可选付费/注册 key（仅当环境变量存在；不 fail-closed）
 KEY_IPINFO=0
@@ -1234,6 +1264,12 @@ for name, s in sources.items():
     if s["ok"] and s["flags"]:
         flag_voters.append((s["title"], list(s["flags"])))
 
+# DoH PTR（不走本机 Clash DNS）；服务器风格计为独立机房票「rDNS」
+print("正在查询 RDAP 与 rDNS（DoH）...", file=sys.stderr)
+rdns_info = ipr.lookup_rdns(IP)
+if rdns_info.get("style") == "host":
+    type_voters.append(("rDNS", "host", "PTR %s" % (rdns_info.get("ptr") or "")))
+
 res_n = sum(1 for _, v, _ in type_voters if v == "res")
 host_n = sum(1 for _, v, _ in type_voters if v == "host")
 host_sources = [title for title, v, _ in type_voters if v == "host"]
@@ -1242,12 +1278,19 @@ flag_sources_n = len(flag_voters)
 
 failed = [s for s in sources.values() if s["enabled"] and not s["ok"]]
 
-# rDNS
+# rDNS（以 DoH PTR 为准，来源里的主机名只作补充）
 hostnames = []
 for s in sources.values():
     hostnames.extend(s.get("hostnames") or [])
+if rdns_info.get("ptr") and rdns_info["ptr"] not in hostnames:
+    hostnames.insert(0, rdns_info["ptr"])
 rdns_votes = []
 rdns_seen = []
+if rdns_info.get("ptr"):
+    rdns_votes.append((rdns_info["ptr"], "res" if rdns_info.get("style") == "res" else (
+        "host" if rdns_info.get("style") == "host" else (
+        "host_weak" if rdns_info.get("style") == "host_weak" else None))))
+    rdns_seen.append(rdns_info["ptr"])
 for h in hostnames:
     if h in rdns_seen:
         continue
@@ -1481,6 +1524,53 @@ for h, sig in rdns_votes:
 if rdns_host_strong and not rdns_res and not type_pass:
     review.append("rDNS 呈机房风格，且类型投票未明确通过，需复核")
 
+# 硬证据：RDAP 登记库（失败不 fail-closed）
+registry = ipr.load_registry(WORKDIR)
+asn_org_early = None
+asn_val_early = None
+_asn_pref, _asn_other = [], []
+for s in sources.values():
+    if not s.get("ok"):
+        continue
+    if s.get("name") == "coffee":
+        d = s.get("_coffee") or {}
+        for k in ("asname", "asOrganization", "as_name"):
+            if d.get(k):
+                _asn_pref.append(str(d[k]))
+    for x in s.get("org_texts") or []:
+        xs = str(x).strip()
+        if not xs:
+            continue
+        if re.search(r"\bAS\d+", xs, re.I) or re.match(r"AS[A-Z0-9-]+$", xs):
+            _asn_pref.append(xs)
+        else:
+            _asn_other.append(xs)
+    if asn_val_early is None and s.get("asns"):
+        asn_val_early = s["asns"][0]
+asn_org_early = _asn_pref[0] if _asn_pref else (_asn_other[0] if _asn_other else None)
+reg_flags, reg_bits = ipr.assess_registry(
+    registry,
+    asn_org=asn_org_early,
+    operator=(op_hit or {}).get("brand") if op_hit else None,
+    asn=asn_val_early,
+    operator_kind=(op_hit or {}).get("kind") if op_hit else None,
+)
+hard = ipr.build_hard_evidence(rdns_info, registry, reg_flags, reg_bits)
+if reg_flags.get("hosting_org") or reg_flags.get("small_reseller"):
+    review.append("登记单位像机房/代理/转售（%s）" % (registry.get("org") or "—"))
+if reg_flags.get("reassigned") and reg_flags.get("mismatch"):
+    review.append("登记网段相对 ASN 组织为转租/转分配")
+elif reg_flags.get("mismatch"):
+    review.append("登记单位与 ASN 组织不一致，可能转租/转分配")
+if reg_flags.get("leased"):
+    review.append("RDAP 备注含租用/IPXO 等租赁标记")
+if reg_flags.get("recent_small"):
+    notes.append("近期登记的较小网段（/%s，%s）" % (registry.get("prefix_len"), registry.get("registered") or "—"))
+if rdns_info.get("style") == "none" and not rdns_info.get("error"):
+    notes.append("无 PTR")
+if rdns_info.get("style") == "res" and rdns_info.get("fcrdns"):
+    notes.append("rDNS 家宽风格且正反向确认（FCrDNS）: %s" % (rdns_info.get("ptr") or ""))
+
 # ---------- 打印 ----------
 def status_of(s):
     if not s["enabled"]:
@@ -1648,15 +1738,7 @@ def pts_dnsbl():
     return 5, "未列"
 
 def pts_rdns():
-    if rdns_host_strong and not rdns_res:
-        hs = [h for h, sig in rdns_votes if sig == "host"]
-        return 0, "机房风格 " + (hs[0] if hs else "")
-    if rdns_res:
-        hs = [h for h, sig in rdns_votes if sig == "res"]
-        return 5, "家宽风格 " + (hs[0] if hs else "")
-    if hostnames:
-        return 2, hostnames[0]
-    return 2, "无"
+    return ipr.rdns_score(rdns_info)
 
 def pts_sources():
     n = len(failed)
@@ -1778,13 +1860,22 @@ def real_signal_phrases():
                 phrases.append("IPLogs verdict=%s（非 clean）" % verd)
     if rdns_host_strong and not rdns_res and not type_pass:
         phrases.append("rDNS 呈机房风格")
+    if reg_flags.get("hosting_org") or reg_flags.get("small_reseller"):
+        phrases.append("登记单位像机房/代理/转售（%s）" % (registry.get("org") or "—"))
+    if reg_flags.get("reassigned") and reg_flags.get("mismatch"):
+        phrases.append("登记网段相对 ASN 组织为转租/转分配")
+    elif reg_flags.get("mismatch"):
+        phrases.append("登记单位与 ASN 组织不一致，可能转租/转分配")
+    if reg_flags.get("leased"):
+        phrases.append("RDAP 备注含租用/IPXO 等租赁标记")
     return phrases
 
 signal_phrases = real_signal_phrases()
 # 判定依据里还有、但上面没结构化到的实际复核项，补进原因，避免漏信号
 structured_markers = ("有 %d 个源判机房" % host_n, "类型投票未通过", "代理/VPN/Tor",
                       "Scamalytics Fraud Score", "Scamalytics 标记", "广播", "非原生",
-                      "DNSBL", "AbuseIPDB", "IPLogs verdict", "rDNS 呈机房")
+                      "DNSBL", "AbuseIPDB", "IPLogs verdict", "rDNS 呈机房",
+                      "登记单位", "转租", "IPXO", "租赁")
 for x in other_reviews:
     if any(m in x for m in structured_markers):
         continue
@@ -1862,9 +1953,25 @@ if cof.get("_dnsbl_ok"):
     else:
         pros.append("DNSBL 未列")
 if rdns_res:
-    pros.append("rDNS 呈家宽风格")
+    if rdns_info.get("fcrdns"):
+        pros.append("rDNS 呈家宽风格且正反向确认（FCrDNS）")
+    else:
+        pros.append("rDNS 呈家宽风格")
 if rdns_host_strong and not rdns_res:
     cons.append("rDNS 呈机房风格")
+elif rdns_info.get("style") == "none" and not rdns_info.get("error"):
+    cons.append("无 PTR")
+if reg_flags.get("consistent_isp"):
+    pros.append("登记单位 %s（ISP）与 ASN 一致" % (registry.get("org") or ""))
+elif reg_flags.get("consistent") and registry.get("org"):
+    # 骨干商一致只作中性说明，不进优点
+    pass
+if reg_flags.get("mismatch"):
+    cons.append("登记单位 %s 与 ASN 组织不一致，可能转租/转分配" % (registry.get("org") or "—"))
+if reg_flags.get("hosting_org") or reg_flags.get("small_reseller"):
+    cons.append("登记单位像机房/代理/转售（%s）" % (registry.get("org") or "—"))
+if reg_flags.get("leased"):
+    cons.append("RDAP 备注含租用/IPXO 等租赁标记")
 if failed:
     cons.append("检测源失败: " + "、".join(s["title"] for s in failed))
 
@@ -1947,6 +2054,7 @@ section_report = ipr.build_report({
     "local25": local25,
     "remote25": remote25,
     "dnsbl": dnsbl,
+    "hard": hard,
 })
 ipr.print_report(section_report, color=ipr.want_color())
 _up, _uc = ipr.unlock_pros_cons(unlock)
@@ -1962,6 +2070,8 @@ print("======== 情况分析 ========")
 print("结论: %s" % conclusion)
 if why_review:
     print("原因: %s" % why_review)
+if hard.get("summary"):
+    print("%s" % hard["summary"])
 print("综合分: %d / 100" % score_total)
 print("  %-16s %4s  %s" % ("项目", "得分", "说明"))
 for name, got, mx, detail in breakdown:
@@ -2038,6 +2148,7 @@ summary = {
     "cons": cons,
     "sections": section_report,
     "mode": mode,
+    "hard_evidence": hard,
 }
 
 json_path = meta.get("json_path") or ""

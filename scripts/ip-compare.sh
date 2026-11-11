@@ -580,6 +580,16 @@ for i, r in enumerate(rows, 1):
     md_lines.append("- 运营商: %s；类型票 %s；代理 %s；Scamalytics %s；%s；黑名单 %s" % (
         op, type_cell(r), flags_text(r), scam_cell(r), native_cell(r), bl_cell(r)
     ))
+    he = (r.get("hard_evidence") or (r.get("sections") or {}).get("hard_evidence")
+          or ((r.get("sections") or {}).get("basic") or {}).get("hard_evidence") or {})
+    if he.get("summary"):
+        md_lines.append("- %s" % he["summary"])
+    elif he:
+        md_lines.append("- 硬证据: 登记单位 %s；分配 %s；rDNS %s" % (
+            (he.get("registry") or {}).get("org") or "—",
+            (he.get("registry") or {}).get("allocation") or "—",
+            (he.get("rdns") or {}).get("style_zh") or "—",
+        ))
     if r.get("failed_sources"):
         md_lines.append("- 失败源: " + "、".join(r["failed_sources"]))
     md_lines.append("")

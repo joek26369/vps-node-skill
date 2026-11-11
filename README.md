@@ -35,7 +35,7 @@
 | 哨兵：即时体检 | `vps-sentinel.sh` |
 | 哨兵：服务端 cron 采集 + 本机拉取分析 | `vps-sentinel-agent.sh` `vps-sentinel-fetch.sh` `vps-sentinel-install.sh` |
 | 生成日检 / 周检 automation 规格 | `vps-automation-spec.sh` |
-| 裸 IP 快查（六段报告：基础信息 / 类型 / 评分 / 因子 / 解锁 / 邮局黑名单，外加留/换分析；解锁与远端 25 需 `--proxy` 或 `--local`） | `ip-check-lite.sh` |
+| 裸 IP 快查（六段报告 + 登记库/rDNS 硬证据 + 留/换分析；解锁与远端 25 需 `--proxy` 或 `--local`） | `ip-check-lite.sh` |
 | 多次裸 IP 快查结果比较（排名 + 六段汇总，哪条更值得留） | `ip-compare.sh` |
 | IP 完整体检（经代理 / VPS 跑 IP.Check.Place 六节，含解锁与黑名单） | `ip-audit.sh` |
 | 仓库自检：脚本语法 + 敏感值 / token 扫描（CI 同款） | `repo-lint.sh` |
