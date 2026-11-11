@@ -6,6 +6,7 @@
 #   bash ip-check-lite.sh <IPv4>
 #   bash ip-check-lite.sh --proxy socks5h://[user:pass@]host:port <IPv4>
 #   bash ip-check-lite.sh --local [IPv4]    # 在该 IP 的机器上跑，测解锁与 25 端口
+#   bash ip-check-lite.sh --note-unlock chatgpt=ok,reddit=blocked <IPv4>
 # 一至四段为裸 IP 查询；五、六段（解锁 / 远端 25）需要 --proxy 或 --local。
 # 黑名单在裸 IP 下也会查（DoH + coffee 服务端）。
 # 硬证据：RDAP（登记单位/网段/分配类型）与 DoH PTR + FCrDNS；失败不 fail-closed。
@@ -60,9 +61,10 @@ ABUSEIPDB_KEY="${ABUSEIPDB_KEY:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  printf '用法: ip-check-lite.sh [--proxy <url>] [--local] <IPv4>\n' >&2
+  printf '用法: ip-check-lite.sh [--proxy <url>] [--local] [--note-unlock <spec>] <IPv4>\n' >&2
   printf '  --proxy socks5h:// 或 http://  经该出口测解锁与远端 25（凭证不打印）\n' >&2
   printf '  --local  在本机出口上测解锁与 25；可省略 IP，自动探测\n' >&2
+  printf '  --note-unlock chatgpt=ok,reddit=blocked,...  记录在其他工具看到的解锁结果（来源：手动）\n' >&2
   printf '暂不支持 IPv6。退出码: 0 通过 / 1 复核 / 3 放弃 / 2 参数错误\n' >&2
 }
 
@@ -84,6 +86,7 @@ mask_proxy_url() {
 # ---- 参数 ----
 PROXY=""
 LOCAL_MODE=0
+NOTE_UNLOCK=""
 IP=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -104,6 +107,17 @@ while [ $# -gt 0 ]; do
       ;;
     --proxy=*)
       PROXY="${1#--proxy=}"
+      ;;
+    --note-unlock)
+      shift
+      NOTE_UNLOCK="${1:-}"
+      if [ -z "$NOTE_UNLOCK" ]; then
+        printf '错误: --note-unlock 需要一项说明，例如 chatgpt=ok,reddit=blocked\n' >&2
+        exit 2
+      fi
+      ;;
+    --note-unlock=*)
+      NOTE_UNLOCK="${1#--note-unlock=}"
       ;;
     --)
       shift
@@ -529,6 +543,13 @@ if [ "$LOCAL_MODE" = 1 ]; then
 fi
 
 # ---- 判定（响应经文件传入 python，不插进源码）----
+if [ -n "$NOTE_UNLOCK" ]; then
+  printf '%s\n' "$NOTE_UNLOCK" > "$WORKDIR/note_unlock.txt"
+  chmod 600 "$WORKDIR/note_unlock.txt" 2>/dev/null || true
+else
+  : > "$WORKDIR/note_unlock.txt"
+fi
+
 {
   printf 'abuse_enabled=%s\n' "$ABUSE_ENABLED"
   printf 'abuse_skip=%s\n' "$ABUSE_SKIP_MSG"
@@ -546,6 +567,7 @@ fi
   printf 'key_ipqs=%s\n' "$KEY_IPQS"
   printf 'key_ipdata=%s\n' "$KEY_IPDATA"
   printf 'key_dbip=%s\n' "$KEY_DBIP"
+  printf 'note_unlock_file=%s\n' "$WORKDIR/note_unlock.txt"
 } > "$WORKDIR/meta.txt"
 
 # 清掉环境里的 key，防止任何子进程或调试输出带出
@@ -2044,6 +2066,18 @@ if mode in ("proxy", "local"):
     elif mode == "proxy":
         remote25 = ipr.check_remote25(cfg=proxy_cfg or None)
 
+# 手动解锁记录（--note-unlock），来源标为「手动」
+note_spec = ""
+_nf = meta.get("note_unlock_file") or os.path.join(WORKDIR, "note_unlock.txt")
+try:
+    if _nf and os.path.isfile(_nf):
+        note_spec = open(_nf, encoding="utf-8").read().strip()
+except OSError:
+    note_spec = ""
+manual_items = ipr.parse_note_unlock(note_spec) if note_spec else []
+if manual_items:
+    unlock = ipr.merge_manual_unlock(unlock, manual_items)
+
 section_report = ipr.build_report({
     "sources": sources,
     "extras": extras,
@@ -2064,6 +2098,33 @@ for x in _up:
 for x in _uc:
     if x not in cons:
         cons.append(x)
+
+# AI 适用分（不影响留/换；综合分仍是家宽真实性）
+_ab_live = {}
+if sources.get("abuseipdb", {}).get("enabled") and sources["abuseipdb"].get("ok"):
+    _ab_live = {
+        "score": sources["abuseipdb"].get("_abuse_score"),
+        "reports": sources["abuseipdb"].get("_abuse_reports"),
+    }
+ai = ipr.score_ai_use({
+    "flags": [{"source": t, "flags": f} for t, f in flag_voters],
+    "scamalytics_score": sources["scamalytics"].get("_score") if sources["scamalytics"]["ok"] else None,
+    "type_votes": {
+        "residential": res_n,
+        "hosting": host_n,
+        "effective_residential": res_eff,
+        "bonus_applied": bool(bonus_applied),
+    },
+    "dnsbl_hits": list(cof.get("_dnsbl_hits") or []),
+    "dnsbl_pbl": list(cof.get("_dnsbl_pbl") or []),
+    "abuseipdb": _ab_live,
+    "hard_evidence": hard,
+    "operator_bonus": bool(bonus_applied),
+    "operator_kind": (op_hit or {}).get("kind") if op_hit else None,
+    "operator": (op_hit or {}).get("brand") if op_hit else None,
+    "unlock": unlock,
+    "sections": {"mail": {"dnsbl": dnsbl}, "unlock": unlock, "hard_evidence": hard},
+})
 
 print()
 print("======== 情况分析 ========")
@@ -2094,6 +2155,8 @@ if cons:
 else:
     print("  （无）")
 print("建议: %s" % suggestion)
+print()
+print(ipr.format_ai_block(ai))
 print("==========================")
 
 # 机器可读摘要（不含任何密钥）
@@ -2149,6 +2212,14 @@ summary = {
     "sections": section_report,
     "mode": mode,
     "hard_evidence": hard,
+    "ai_score": ai.get("score"),
+    "ai_verdict": ai.get("verdict"),
+    "ai_reasons": ai.get("reasons") or [],
+    "ai_breakdown": ai.get("breakdown") or [],
+    "ai_summary": ai.get("summary"),
+    "unlock": unlock,
+    "note_unlock": note_spec or None,
+    "abuseipdb": _ab_live or None,
 }
 
 json_path = meta.get("json_path") or ""

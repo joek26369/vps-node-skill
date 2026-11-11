@@ -3,7 +3,7 @@ name: vps-node
 description: Pre-flight a freshly bought VPS (hardware / IP reputation / return route, nothing installed) and only then provision a production-ready proxy node — sing-box (VLESS+REALITY :443 + Hysteria2 :8443), BBR tuning, DuckDNS + Let's Encrypt HTTPS subscription endpoint, security hardening (ufw/SSH/sysctl/fail2ban), and a 9-source external IP reputation audit. Use when the user buys a new VPS, wants to set up a 节点/机场/梯子, replace a residential proxy node, or asks to harden + audit a VPS.
 description_zh: "新 VPS 上线全流程：先验货（硬件/IP 质量/回程，不装机）→ sing-box 双协议节点 + BBR + 免费域名 HTTPS 订阅 + 安全加固 + IP 风险体检 → 验收 → 服务端哨兵"
 description_en: "One-shot VPS node deployment: sing-box dual protocol, BBR, HTTPS subscription via DuckDNS+LE, hardening, IP reputation audit"
-version: 1.13.1
+version: 1.14.0
 allowed-tools: Read,Write,Edit,Bash
 display_name: "VPS 节点上线"
 visibility: "public"
@@ -417,7 +417,7 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 
 | 时机 | 你手上有什么 | 用什么 | 能测到 |
 |---|---|---|---|
-| **购买前** | 只有一个**裸 IP**（试用、别人给的、还没买） | `ip-check-lite.sh <IP>` | 六段报告（基础信息、类型属性、风险评分、风险因子、解锁、邮局/黑名单）+ 留/换分析。一至四段与黑名单为裸 IP 查询；解锁和远端 25 需 `--proxy` 或在该 IP 的机器上 `--local`。源：ipinfo、IPLogs、Scamalytics、ip.net.coffee、ipx.al、iping.cc、ipwho.is、ip2location.io 免费层、DB-IP 免费层、ipapi.is 免费层；另查 RDAP 登记库与 DoH PTR（硬证据）；可选 key 见下 |
+| **购买前** | 只有一个**裸 IP**（试用、别人给的、还没买） | `ip-check-lite.sh <IP>` | 六段报告（基础信息、类型属性、风险评分、风险因子、解锁、邮局/黑名单）+ 留/换分析。一至四段与黑名单为裸 IP 查询；解锁和远端 25 需 `--proxy` 或在该 IP 的机器上 `--local`（另可用 `--note-unlock` 记下在其他工具看到的解锁结果）。另有「AI 适用分」（0–100）专用于 ChatGPT/Claude 等 AI 出口是否干净。源：ipinfo、IPLogs、Scamalytics、ip.net.coffee、ipx.al、iping.cc、ipwho.is、ip2location.io 免费层、DB-IP 免费层、ipapi.is 免费层；另查 RDAP 登记库与 DoH PTR（硬证据）；可选 key 见下 |
 | **购买后·情况一** | **代理型 IP**：有 socks5/http 凭据，IP 未配进任何机器 | `ip-audit.sh --proxy 'socks5h://user:pass@host:port' --expect <IP> [--node <别名>]` | 全六节（含流媒体/AI 解锁、423 库黑名单、IPQS） |
 | **购买后·情况二** | **纯 VPS**：有 SSH | `ip-audit.sh --vps-ip <IP> --vps-port <端口>` | 全六节 |
 | 已配进本 skill 的出站 | 凭据别名 + egress 名 | `ip-audit.sh --node <别名> --egress us1` | 全六节（凭据从 VPS 侧解析，不落本地明文） |
@@ -457,13 +457,20 @@ bash scripts/ip-check-lite.sh --proxy http://host:8080 <IP>
 # 已经在这台 VPS / 该出口的机器上
 bash scripts/ip-check-lite.sh --local          # 自动探测出口 IP
 bash scripts/ip-check-lite.sh --local <IP>    # 若本机出口与 <IP> 不符会标「不匹配」
+
+# 记下在 IPQuality 等工具里看到的解锁结果（来源标「手动」，可与 --proxy 同时用）
+bash scripts/ip-check-lite.sh --note-unlock 'tiktok=原生,disney=原生,youtube=原生,amazonpv=原生,chatgpt=原生,netflix=dns,reddit=屏蔽' <IP>
 ```
 
-解锁结果只写入优点/风险，**不改变** 留/换结论。ChatGPT / Reddit 等被屏蔽会列为风险。本机 stdout 是终端时会着色，可用 `NO_COLOR=1` 关掉。
+解锁结果只写入优点/风险，**不改变** 留/换结论。ChatGPT / Reddit / Claude / Gemini 等被屏蔽会列为风险。
 
-每次快查结束会打印「情况分析」：结论（留 / 换 / 待复核）、硬证据一行（登记单位与 ASN 是否一致、rDNS/FCrDNS）、0–100 综合分（类型投票、主流运营商加分、代理标志、Scamalytics、原生/广播、DNSBL、rDNS、源完整性；AbuseIPDB 有结果时再加减），以及优点、风险和一句建议。家宽风格 + FCrDNS 占满 rDNS 分；无 PTR 小幅扣分。待复核会写明原因：仅当完全没有实际信号时才写「仅检测源失败」；否则先列出实际信号（例如有 N 个源判机房、代理/VPN 标记），检测源失败只作为补充。机器可读摘要写在 `~/.vps-node/ipaudits/<IP>/lite-<stamp>.json`（权限 600），不含密钥。
+另有「AI 适用分」（0–100），与综合分（家宽真实性）分开算：代理/VPN/Tor 和真实黑名单/AbuseIPDB 权重大（Scamalytics、IPQS 类来源比 IPLogs 这类标签扣得更重），Scamalytics Fraud Score 中等，机房票较轻（3:2 只小扣，机房多数仍重扣），登记不一致/无 PTR 很轻，主流运营商小加分。若已测或手动记录了 ChatGPT/Claude/Gemini，解锁结果权重最大：ChatGPT 解锁大幅加分，屏蔽大幅减分。情况分析里会印「AI 用途: xx / 100  建议：可用/观察/不建议」及原因。Claude（claude.ai 区域页）和 Gemini（gemini.google.com）在 `--proxy` / `--local` 时做轻量探测。
+本机 stdout 是终端时会着色，可用 `NO_COLOR=1` 关掉。
 
-测了多条 IP 之后，用 `ip-compare.sh` 做整体比较，看哪条更值得留：
+每次快查结束会打印「情况分析」：结论（留 / 换 / 待复核）、硬证据一行、0–100 综合分（家宽真实性：类型投票、主流运营商加分、代理标志、Scamalytics、原生/广播、DNSBL、rDNS、源完整性；AbuseIPDB 有结果时再加减）、优点/风险/建议，以及「AI 用途」适用分与可用/观察/不建议。家宽风格 + FCrDNS 占满 rDNS 分；无 PTR 小幅扣分。待复核会写明原因：仅当完全没有实际信号时才写「仅检测源失败」；否则先列出实际信号（例如有 N 个源判机房、代理/VPN 标记），检测源失败只作为补充。机器可读摘要写在 `~/.vps-node/ipaudits/<IP>/lite-<stamp>.json`（权限 600），不含密钥。
+
+测了多条 IP 之后，用 `ip-compare.sh` 做整体比较。默认按综合分（家宽真实性）排名；看 ChatGPT/Claude 出口用 `--for ai` 按 AI 适用分排名（并列时优先更少的代理/VPN 标记、ChatGPT 已解锁、更低的 Scamalytics）。Markdown 报告始终同时给出两套排名。
+
 
 ```bash
 # 分 5 次各测一条（每次都会给出该 IP 的留 / 换 / 待复核）
@@ -557,6 +564,7 @@ bash scripts/ip-check-lite.sh --proxy socks5h://host:1080 <IP>
 bash scripts/ip-check-lite.sh --local
 # 比较多次快查结果（含六段汇总），看哪条更值得留
 bash scripts/ip-compare.sh <IP1> <IP2> <IP3>
+bash scripts/ip-compare.sh --for ai <IP1> <IP2> <IP3>
 bash scripts/ip-compare.sh --all
 bash scripts/ip-compare.sh --mask --rerun <IP1> <IP2>
 # 购买后·情况一：有代理凭据，经 VPS 转发跑全六节（凭据走 stdin，不进命令行；--expect 必填）

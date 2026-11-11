@@ -17,6 +17,44 @@ UA = (
     "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
 )
 
+UNLOCK_SERVICES = [
+    "TikTok", "Disney+", "Netflix", "YouTube", "AmazonPV", "Reddit",
+    "ChatGPT", "Claude", "Gemini",
+]
+
+NOTE_UNLOCK_ALIASES = {
+    "tiktok": "TikTok", "tt": "TikTok",
+    "disney": "Disney+", "disney+": "Disney+", "disneyplus": "Disney+",
+    "netflix": "Netflix", "nf": "Netflix",
+    "youtube": "YouTube", "yt": "YouTube", "ytb": "YouTube",
+    "amazonpv": "AmazonPV", "amazon": "AmazonPV", "prime": "AmazonPV",
+    "primevideo": "AmazonPV", "amazonprime": "AmazonPV",
+    "reddit": "Reddit",
+    "chatgpt": "ChatGPT", "gpt": "ChatGPT", "openai": "ChatGPT",
+    "claude": "Claude", "anthropic": "Claude",
+    "gemini": "Gemini", "bard": "Gemini",
+}
+
+# 状态词：左边是用户可能写的，右边是报告用的状态；原生/DNS 另作方式
+NOTE_STATUS_MAP = {
+    "ok": "解锁", "yes": "解锁", "unlock": "解锁", "unlocked": "解锁",
+    "pass": "解锁", "open": "解锁", "on": "解锁",
+    "解锁": "解锁", "原生": "解锁", "native": "解锁",
+    "dns": "解锁",
+    "blocked": "屏蔽", "block": "屏蔽", "no": "屏蔽", "deny": "屏蔽",
+    "denied": "屏蔽", "off": "屏蔽", "ban": "屏蔽",
+    "屏蔽": "屏蔽", "不可用": "屏蔽",
+    "self": "仅自制", "自制": "仅自制", "仅自制": "仅自制", "originals": "仅自制",
+    "app": "仅APP", "仅app": "仅APP", "仅APP": "仅APP",
+    "web": "仅网页", "仅网页": "仅网页",
+    "fail": "失败", "failed": "失败", "失败": "失败",
+    "untested": "未测", "未测": "未测",
+}
+
+HIGH_FLAG_SOURCES = ("scamalytics", "ipqs", "ipquality", "ipdata", "ipregistry", "ipinfo")
+
+
+
 DNSBL_ZONES = [
     ("zen.spamhaus.org", "Spamhaus ZEN", "mixed"),
     ("sbl.spamhaus.org", "Spamhaus SBL", "black"),
@@ -1171,6 +1209,62 @@ def check_chatgpt(cfg=None):
     return {"name": "ChatGPT", "status": "失败", "region": loc or "—", "method": "—"}
 
 
+
+def check_claude(cfg=None):
+    """Lightweight Claude geo check: claude.ai unavailable-in-region / 403."""
+    method = _dns_method("claude.ai")
+    rc, out, err = _curl(
+        ["-w", "\n__HTTP__:%{http_code} %{url_effective}", "https://claude.ai/"],
+        timeout=12, cfg=cfg,
+    )
+    text = (out or "") + "\n" + (err or "")
+    low = text.lower()
+    code, url = "000", ""
+    m = re.search(r"__HTTP__:(\d{3})\s+(\S+)", text)
+    if m:
+        code, url = m.group(1), m.group(2)
+    blocked = any(s in low or s in (url or "").lower() for s in (
+        "app-unavailable-in-region", "not available in your country",
+        "isn't available in your country", "is not available in your country",
+        "unavailable-in-region", "/unavailable", "blocked-in-region",
+    ))
+    if blocked or code == "403":
+        return {"name": "Claude", "status": "屏蔽", "region": "—", "method": "—"}
+    if rc != 0 and code in ("000", "000"):
+        return {"name": "Claude", "status": "失败", "region": "—", "method": "—"}
+    if code.startswith("2") or code.startswith("3"):
+        return {"name": "Claude", "status": "解锁", "region": "—", "method": method}
+    return {"name": "Claude", "status": "失败", "region": "—", "method": "—"}
+
+
+def check_gemini(cfg=None):
+    """Lightweight Gemini geo check on gemini.google.com."""
+    method = _dns_method("gemini.google.com")
+    rc, out, err = _curl(
+        ["-w", "\n__HTTP__:%{http_code} %{url_effective}", "https://gemini.google.com/"],
+        timeout=12, cfg=cfg,
+    )
+    text = (out or "") + "\n" + (err or "")
+    low = text.lower()
+    code, url = "000", ""
+    m = re.search(r"__HTTP__:(\d{3})\s+(\S+)", text)
+    if m:
+        code, url = m.group(1), m.group(2)
+    blocked = any(s in low or s in (url or "").lower() for s in (
+        "not available in your country", "isn't available in your country",
+        "is not available in your country", "unavailable in your country",
+        "country_unavailable", "/unavailable", "gemini is not available",
+    ))
+    if blocked or code == "403":
+        return {"name": "Gemini", "status": "屏蔽", "region": "—", "method": "—"}
+    if rc != 0 and code in ("000",):
+        return {"name": "Gemini", "status": "失败", "region": "—", "method": "—"}
+    if code.startswith("2") or code.startswith("3"):
+        return {"name": "Gemini", "status": "解锁", "region": "—", "method": method}
+    return {"name": "Gemini", "status": "失败", "region": "—", "method": "—"}
+
+
+
 def check_disney(cfg=None):
     # 精简探测：看主站是否跳到不可用页 / 能否打开
     method = _dns_method("disneyplus.com")
@@ -1214,7 +1308,7 @@ def check_remote25(cfg=None):
 def run_unlock(target_ip, mode, cfg_path=None):
     services_empty = [
         {"name": n, "status": "未测", "region": "—", "method": "—"}
-        for n in ("TikTok", "Disney+", "Netflix", "YouTube", "AmazonPV", "Reddit", "ChatGPT")
+        for n in UNLOCK_SERVICES
     ]
     if mode == "bare":
         return {
@@ -1238,11 +1332,13 @@ def run_unlock(target_ip, mode, cfg_path=None):
     warning = None
     if not match:
         warning = "出口 IP %s 与目标 %s 不匹配，解锁结果不能代表目标 IP" % (exit_ip, target_ip)
-    checks = [check_tiktok, check_disney, check_netflix, check_youtube, check_amazon, check_reddit, check_chatgpt]
+    checks = [check_tiktok, check_disney, check_netflix, check_youtube, check_amazon,
+              check_reddit, check_chatgpt, check_claude, check_gemini]
     services = []
     pretty = {
         "tiktok": "TikTok", "disney": "Disney+", "netflix": "Netflix",
-        "youtube": "YouTube", "amazon": "AmazonPV", "reddit": "Reddit", "chatgpt": "ChatGPT",
+        "youtube": "YouTube", "amazon": "AmazonPV", "reddit": "Reddit",
+        "chatgpt": "ChatGPT", "claude": "Claude", "gemini": "Gemini",
     }
     for fn in checks:
         try:
@@ -1603,7 +1699,7 @@ def empty_unlock():
         "reason": "未测（需 --proxy 或在该 IP 的机器上运行）",
         "exit_ip": None, "exit_match": None,
         "services": [{"name": n, "status": "未测", "region": "—", "method": "—"}
-                     for n in ("TikTok", "Disney+", "Netflix", "YouTube", "AmazonPV", "Reddit", "ChatGPT")],
+                     for n in UNLOCK_SERVICES],
     }
 
 
@@ -1766,6 +1862,8 @@ def print_report(report, color=False):
         print("  状态：    " + "  ".join(s.get("status") or "—" for s in svcs))
         print("  地区：    " + "  ".join(s.get("region") or "—" for s in svcs))
         print("  方式：    " + "  ".join(s.get("method") or "—" for s in svcs))
+        if any(s.get("source") == "手动" for s in svcs):
+            print("  来源：    " + "  ".join((s.get("source") if s.get("source") == "手动" else "—") for s in svcs))
 
     print()
     print("%s六、邮局连通性及黑名单检测%s" % (c.bold, c.reset))
@@ -1783,16 +1881,28 @@ def print_report(report, color=False):
 
 
 def unlock_pros_cons(unlock):
-    if not unlock or not unlock.get("tested") or unlock.get("exit_match") is False:
+    if not unlock:
+        return [], []
+    has_manual = any((s.get("source") == "手动") for s in (unlock.get("services") or []))
+    if unlock.get("exit_match") is False and not has_manual:
+        return [], []
+    if not unlock.get("tested") and not has_manual:
         return [], []
     pros, cons = [], []
     for s in unlock.get("services") or []:
         name, st = s.get("name"), s.get("status")
+        # 出口不匹配时，只用手动记录
+        if unlock.get("exit_match") is False and s.get("source") != "手动":
+            continue
+        tag = "（手动）" if s.get("source") == "手动" else ""
         if st in ("屏蔽", "禁会员", "中国", "仅自制"):
-            cons.append("%s %s" % (name, st))
-        elif st == "解锁" and name in ("Netflix", "Disney+", "YouTube", "ChatGPT"):
+            cons.append("%s %s%s" % (name, st, tag))
+        elif st == "解锁" and name in ("Netflix", "Disney+", "YouTube", "ChatGPT", "Claude", "Gemini"):
             rg = s.get("region")
-            pros.append("%s 解锁（%s）" % (name, rg) if rg and rg != "—" else "%s 解锁" % name)
+            if rg and rg != "—":
+                pros.append("%s 解锁（%s）%s" % (name, rg, tag))
+            else:
+                pros.append("%s 解锁%s" % (name, tag))
     return pros, cons
 
 
@@ -1890,7 +2000,7 @@ def format_compare_section_tables(rows):
                 x.get("abuser") or "—", x.get("robot") or "—"))
         md_lines.append("")
 
-    svc_names = ["TikTok", "Disney+", "Netflix", "YouTube", "AmazonPV", "Reddit", "ChatGPT"]
+    svc_names = list(UNLOCK_SERVICES)
     hdr = "| IP | " + " | ".join(svc_names) + " |"
     lines = []
     for r in rows:
@@ -1915,3 +2025,388 @@ def format_compare_section_tables(rows):
             bl.get("total_valid", "—"), bl.get("clean", "—"), bl.get("marked", "—"), bl.get("listed", "—")))
     add_table("六、邮局连通性及黑名单", hdr, lines)
     return "\n".join(t_lines), "\n".join(md_lines)
+
+def parse_note_unlock(spec):
+    """Parse --note-unlock 'chatgpt=ok,reddit=blocked,netflix=dns'. Returns list of service dicts."""
+    if not spec or not str(spec).strip():
+        return []
+    items = []
+    for raw in str(spec).split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        if "=" not in raw and ":" not in raw:
+            continue
+        if "=" in raw:
+            k, _, v = raw.partition("=")
+        else:
+            k, _, v = raw.partition(":")
+        key = k.strip().lower().replace(" ", "")
+        val = v.strip()
+        name = NOTE_UNLOCK_ALIASES.get(key)
+        if not name:
+            # allow exact report names
+            for n in UNLOCK_SERVICES:
+                if n.lower().replace("+", "") == key.replace("+", ""):
+                    name = n
+                    break
+        if not name or not val:
+            continue
+        val_l = val.lower().replace(" ", "")
+        method = "手动"
+        if val_l in ("原生", "native"):
+            status, method = "解锁", "原生"
+        elif val_l in ("dns",):
+            status, method = "解锁", "DNS"
+        else:
+            status = NOTE_STATUS_MAP.get(val_l) or NOTE_STATUS_MAP.get(val.strip())
+            if not status:
+                # 允许 解锁(原生) / 解锁/原生
+                m = re.match(r"^(解锁|屏蔽|仅自制|仅APP|仅网页|失败|未测)(?:[（(/]+(原生|DNS|dns|手动)?", val.strip())
+                if m:
+                    status = m.group(1)
+                    if m.group(2):
+                        method = "DNS" if m.group(2).lower() == "dns" else ("原生" if m.group(2) in ("原生", "native") else "手动")
+                else:
+                    continue
+        items.append({
+            "name": name, "status": status, "region": "—", "method": method,
+            "source": "手动",
+        })
+    # last mention wins
+    out = {}
+    for it in items:
+        out[it["name"]] = it
+    return [out[n] for n in UNLOCK_SERVICES if n in out]
+
+
+def merge_manual_unlock(unlock, manual_items):
+    """Fill/override services with user-observed results (source=手动)."""
+    unlock = unlock or empty_unlock()
+    services = list(unlock.get("services") or [])
+    by = {s.get("name"): dict(s) for s in services}
+    for n in UNLOCK_SERVICES:
+        if n not in by:
+            by[n] = {"name": n, "status": "未测", "region": "—", "method": "—"}
+    for it in manual_items or []:
+        name = it.get("name")
+        if not name:
+            continue
+        cur = by.get(name) or {"name": name, "status": "未测", "region": "—", "method": "—"}
+        cur["status"] = it.get("status") or cur.get("status")
+        if it.get("region") and it.get("region") != "—":
+            cur["region"] = it["region"]
+        cur["method"] = it.get("method") or "手动"
+        cur["source"] = "手动"
+        by[name] = cur
+    unlock = dict(unlock)
+    unlock["services"] = [by[n] for n in UNLOCK_SERVICES]
+    if manual_items:
+        unlock["has_manual"] = True
+        if not unlock.get("tested"):
+            # 仅手动记录时，不要把整段标成「未测」
+            reason = unlock.get("reason") or ""
+            extra = "部分结果来自手动记录（--note-unlock）"
+            if "未测（需 --proxy" in reason or not unlock.get("tested"):
+                unlock["reason"] = extra
+    return unlock
+
+
+def _svc(unlock, name):
+    for s in (unlock or {}).get("services") or []:
+        if s.get("name") == name:
+            return s
+    return {}
+
+
+def _ai_status(unlock, name):
+    st = (_svc(unlock, name) or {}).get("status") or "未测"
+    if st in ("未测", "失败", "—", "", None):
+        return None
+    return st
+
+
+def has_ai_unlock_data(unlock):
+    return any(_ai_status(unlock, n) for n in ("ChatGPT", "Claude", "Gemini"))
+
+
+def _flag_kind(title):
+    t = (title or "").lower()
+    for h in HIGH_FLAG_SOURCES:
+        if h in t:
+            return "high"
+    return "low"
+
+
+def _flags_from_row(flags):
+    """Return (high_n, low_n, labels). flags is JSON list of {source, flags}."""
+    high = low = 0
+    labels = []
+    for item in flags or []:
+        if isinstance(item, dict):
+            title = item.get("source") or item.get("title") or ""
+            fl = item.get("flags") or []
+        else:
+            title, fl = str(item), ["flag"]
+        if not fl:
+            continue
+        kind = _flag_kind(title)
+        if kind == "high":
+            high += 1
+        else:
+            low += 1
+        labels.append("%s(%s)" % (title, "/".join(fl) if isinstance(fl, (list, tuple)) else fl))
+    return high, low, labels
+
+
+def score_ai_use(row):
+    """AI 适用分 0-100. row 可以是 lite JSON，或现场拼好的同名字段。"""
+    flags = row.get("flags") or []
+    high_n, low_n, flag_labs = _flags_from_row(flags)
+    scam = row.get("scamalytics_score")
+    try:
+        scam = int(scam) if scam is not None else None
+    except (TypeError, ValueError):
+        scam = None
+    tv = row.get("type_votes") or {}
+    try:
+        res_n = int(tv.get("residential") or 0)
+    except (TypeError, ValueError):
+        res_n = 0
+    try:
+        host_n = int(tv.get("hosting") or 0)
+    except (TypeError, ValueError):
+        host_n = 0
+    host_majority = host_n > res_n and host_n >= 2
+
+    dnsbl_hits = row.get("dnsbl_hits") or []
+    # 也可能在 sections.mail.dnsbl
+    mail = ((row.get("sections") or {}).get("mail") or {})
+    bl = mail.get("dnsbl") or {}
+    listed = bl.get("listed") or 0
+    abuse = row.get("abuseipdb") or {}
+    try:
+        ascore = int(abuse["score"]) if abuse.get("score") is not None else None
+    except (TypeError, ValueError, KeyError):
+        ascore = None
+    try:
+        reps = int(abuse.get("reports") or 0)
+    except (TypeError, ValueError):
+        reps = 0
+    # breakdown fallback for older JSON
+    if ascore is None:
+        for b in row.get("breakdown") or []:
+            if b.get("item") == "AbuseIPDB" and "score" in str(b.get("detail") or ""):
+                m = re.search(r"score\s*[:=]?\s*(\d+)", str(b.get("detail")))
+                if m:
+                    try:
+                        ascore = int(m.group(1))
+                    except ValueError:
+                        pass
+
+    he = row.get("hard_evidence") or ((row.get("sections") or {}).get("hard_evidence") or {})
+    he_flags = he.get("flags") or {}
+    rdns = he.get("rdns") or {}
+    no_ptr = (rdns.get("style") == "none") or (not rdns.get("ptr") and not rdns.get("error"))
+    # 旧 JSON 无硬证据时不要乱扣
+    if not he:
+        no_ptr = False
+
+    bonus = bool(row.get("operator_bonus"))
+    consistent_isp = bool(he_flags.get("consistent_isp"))
+    business = (row.get("operator_kind") == "business")
+
+    unlock = row.get("unlock") or ((row.get("sections") or {}).get("unlock") or {})
+
+    # ----- 代理/VPN/Tor 30：高权重源（Scamalytics/IPQS 等）扣得更重 -----
+    # 每个高权重源 -20，低权重（IPLogs 等）-10
+    p_flags = 30 - 20 * high_n - 10 * low_n
+    if p_flags < 0:
+        p_flags = 0
+    if high_n == 0 and low_n == 0:
+        d_flags = "无"
+    else:
+        d_flags = "、".join(flag_labs) + ("（高权重源）" if high_n else "（低权重源）")
+
+    # ----- 滥用/黑名单 25 -----
+    dirty_bl = bool(dnsbl_hits) or (isinstance(listed, int) and listed > 0)
+    dirty_abuse = (ascore is not None and ascore >= 25) or reps >= 5
+    severe_abuse = (ascore is not None and ascore >= 75)
+    if dirty_bl or severe_abuse:
+        p_ab, d_ab = 0, "黑名单命中或 AbuseIPDB 放弃线"
+        if dnsbl_hits:
+            d_ab = "DNSBL 命中: " + "; ".join(str(x) for x in dnsbl_hits[:4])
+        elif severe_abuse:
+            d_ab = "AbuseIPDB score %s" % ascore
+    elif dirty_abuse:
+        p_ab, d_ab = 8, "AbuseIPDB score=%s reports=%s" % (ascore, reps)
+    else:
+        p_ab, d_ab = 25, "未列" if not dnsbl_hits else "仅 PBL"
+
+    # ----- Scamalytics 15（中等）-----
+    if scam is None:
+        p_sc, d_sc = 8, "未取到分数"
+    elif scam <= 10:
+        p_sc, d_sc = 15, "%d（低）" % scam
+    elif scam <= 25:
+        # 11 → 9，25 → 5
+        p_sc = int(round(9 - (scam - 11) * (9 - 5) / 14.0))
+        if p_sc < 4:
+            p_sc = 4
+        d_sc = "%d（11–25）" % scam
+    else:
+        p_sc, d_sc = 0, "%d（>25）" % scam
+
+    # ----- 机房票 15：3:2 只轻扣，机房多数仍重扣 -----
+    if host_n == 0:
+        p_ho, d_ho = 15, "机房 0 票"
+    elif host_majority:
+        p_ho, d_ho = 0, "机房多数 %d:%d" % (res_n, host_n)
+    elif host_n >= 2:
+        p_ho, d_ho = 12, "家宽 %d : 机房 %d（轻扣）" % (res_n, host_n)
+    else:
+        p_ho, d_ho = 13, "家宽 %d : 机房 %d" % (res_n, host_n)
+
+    # ----- 登记/rDNS 5：很轻 -----
+    p_reg = 5
+    bits = []
+    if he_flags.get("mismatch") or he_flags.get("reassigned"):
+        p_reg -= 2
+        bits.append("登记与 ASN 不一致")
+    if no_ptr:
+        p_reg -= 2
+        bits.append("无 PTR")
+    if he_flags.get("leased") or he_flags.get("hosting_org"):
+        p_reg -= 1
+        bits.append("租用/机房登记")
+    if p_reg < 0:
+        p_reg = 0
+    d_reg = "；".join(bits) if bits else "无特别风险"
+
+    # ----- 主流运营商 10：小加分 -----
+    if bonus or (consistent_isp and not business):
+        p_isp, d_isp = 10, (row.get("operator") or (he.get("registry") or {}).get("org") or "ISP")
+    else:
+        p_isp, d_isp = 0, "无"
+
+    base = p_flags + p_ab + p_sc + p_ho + p_reg + p_isp
+
+    # ----- 解锁加减（有 ChatGPT/Claude/Gemini 结果时才计入，且权重大）-----
+    adj = 0
+    adj_bits = []
+    if has_ai_unlock_data(unlock):
+        def _one(name, plus, minus, mid=0):
+            st = _ai_status(unlock, name)
+            svc = _svc(unlock, name)
+            src = "手动" if (svc.get("source") == "手动") else None
+            tag = "（手动%s）" % (("，" + svc.get("method")) if svc.get("method") in ("原生", "DNS") else "") if src else ""
+            if svc.get("source") == "手动" and not tag.endswith("）"):
+                tag = "（手动）"
+            if st == "解锁":
+                return plus, "%s 解锁%s" % (name, tag)
+            if st in ("仅APP", "仅网页"):
+                return mid or max(1, plus // 3), "%s %s%s" % (name, st, tag)
+            if st == "屏蔽":
+                return minus, "%s 屏蔽%s" % (name, tag)
+            return 0, None
+
+        a, b = _one("ChatGPT", 20, -25, mid=6)
+        adj += a
+        if b:
+            adj_bits.append(b)
+        a, b = _one("Claude", 8, -10, mid=0)
+        adj += a
+        if b:
+            adj_bits.append(b)
+        a, b = _one("Gemini", 5, -6, mid=0)
+        adj += a
+        if b:
+            adj_bits.append(b)
+        d_unl = "；".join(adj_bits) if adj_bits else "—"
+    else:
+        d_unl = "未测 ChatGPT/Claude/Gemini，不加解锁分"
+
+    total = base + adj
+    if total < 0:
+        total = 0
+    if total > 100:
+        total = 100
+
+    # 建议
+    cg = _ai_status(unlock, "ChatGPT")
+    reasons = []
+    if any("ChatGPT 解锁" in x for x in adj_bits):
+        reasons.append([x for x in adj_bits if x.startswith("ChatGPT")][0])
+    elif cg == "屏蔽":
+        reasons.append("ChatGPT 屏蔽")
+    for x in adj_bits:
+        if x.startswith("Claude") or x.startswith("Gemini"):
+            reasons.append(x)
+    if high_n == 0 and low_n == 0:
+        reasons.append("无代理/VPN/Tor 标志")
+    else:
+        reasons.append("代理/VPN 标记: " + d_flags)
+    reasons.append("黑名单" + ("命中" if dirty_bl else "未列"))
+    if scam is not None:
+        reasons.append("Scamalytics %d" % scam)
+    if host_majority:
+        reasons.append("机房多数 %d:%d" % (res_n, host_n))
+    elif host_n >= 2:
+        reasons.append("机房票 %d:%d" % (res_n, host_n))
+    if bits:
+        reasons.extend(bits)
+
+    if cg == "屏蔽" or dirty_bl or severe_abuse or high_n + low_n >= 2 or (high_n >= 1 and low_n >= 1):
+        verdict = "不建议"
+    elif host_majority and (cg != "解锁"):
+        verdict = "不建议"
+    elif total >= 75 and high_n == 0 and not dirty_bl and not host_majority and cg != "屏蔽":
+        # 有 ChatGPT 解锁，或完全干净且未测解锁：可用；仅有低权重标记时改观察
+        if cg == "解锁" or (cg is None and low_n == 0):
+            verdict = "可用"
+        else:
+            verdict = "观察"
+    elif total >= 50:
+        verdict = "观察"
+    else:
+        verdict = "不建议"
+
+    # 有中段风险时，可用降为观察？Fraud 25 + 3:2 仍可「可用」但原因里写明。按上面规则 72.1 为可用。
+    breakdown = [
+        ("代理/VPN/Tor", p_flags, 30, d_flags),
+        ("滥用/黑名单", p_ab, 25, d_ab),
+        ("Scamalytics", p_sc, 15, d_sc),
+        ("机房票", p_ho, 15, d_ho),
+        ("登记/rDNS", p_reg, 5, d_reg),
+        ("主流运营商", p_isp, 10, d_isp),
+        ("解锁加减", adj, 0, d_unl),
+    ]
+    summary = "AI 用途: %d / 100  建议：%s" % (total, verdict)
+    return {
+        "score": total,
+        "verdict": verdict,
+        "reasons": reasons,
+        "breakdown": [
+            {"item": n, "points": g, "max": m, "detail": d} for n, g, m, d in breakdown
+        ],
+        "summary": summary,
+        "adjustment": adj,
+        "base": base,
+        "chatgpt": cg,
+    }
+
+
+def format_ai_block(ai, color=False):
+    if not ai:
+        return ""
+    lines = [ai.get("summary") or ("AI 用途: %s / 100" % ai.get("score"))]
+    for row in ai.get("breakdown") or []:
+        mx = row.get("max") or 0
+        got = row.get("points")
+        if row.get("item") == "解锁加减":
+            lines.append("  %-16s %+4d  %s" % (row.get("item"), got, row.get("detail") or ""))
+        else:
+            lines.append("  %-16s %2d/%-2d  %s" % (row.get("item"), got, mx, row.get("detail") or ""))
+    if ai.get("reasons"):
+        lines.append("  原因: " + "；".join(ai["reasons"]))
+    return "\n".join(lines)
