@@ -3,7 +3,7 @@ name: vps-node
 description: Pre-flight a freshly bought VPS (hardware / IP reputation / return route, nothing installed) and only then provision a production-ready proxy node — sing-box (VLESS+REALITY :443 + Hysteria2 :8443), BBR tuning, DuckDNS + Let's Encrypt HTTPS subscription endpoint, security hardening (ufw/SSH/sysctl/fail2ban), and a 9-source external IP reputation audit. Use when the user buys a new VPS, wants to set up a 节点/机场/梯子, replace a residential proxy node, or asks to harden + audit a VPS.
 description_zh: "新 VPS 上线全流程：先验货（硬件/IP 质量/回程，不装机）→ sing-box 双协议节点 + BBR + 免费域名 HTTPS 订阅 + 安全加固 + IP 风险体检 → 验收 → 服务端哨兵"
 description_en: "One-shot VPS node deployment: sing-box dual protocol, BBR, HTTPS subscription via DuckDNS+LE, hardening, IP reputation audit"
-version: 1.10.2
+version: 1.11.0
 allowed-tools: Read,Write,Edit,Bash
 display_name: "VPS 节点上线"
 visibility: "public"
@@ -417,28 +417,42 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 
 | 时机 | 你手上有什么 | 用什么 | 能测到 |
 |---|---|---|---|
-| **购买前** | 只有一个**裸 IP**（试用、别人给的、还没买） | `ip-check-lite.sh <IP>` | 静态项：归属 / IP 类型 / 风险评分 / 风险因子（免注册三源：ipinfo + IPLogs + Scamalytics） |
+| **购买前** | 只有一个**裸 IP**（试用、别人给的、还没买） | `ip-check-lite.sh <IP>` | 归属 / 类型投票 / 风险标志 / 原生或广播 / **DNSBL（coffee 服务端查询）** / 可选 AbuseIPDB。源：ipinfo、IPLogs、Scamalytics、ip.net.coffee、ipx.al、iping.cc，（可选）AbuseIPDB |
 | **购买后·情况一** | **代理型 IP**：有 socks5/http 凭据，IP 未配进任何机器 | `ip-audit.sh --proxy 'socks5h://user:pass@host:port' --expect <IP> [--node <别名>]` | 全六节（含流媒体/AI 解锁、423 库黑名单、IPQS） |
 | **购买后·情况二** | **纯 VPS**：有 SSH | `ip-audit.sh --vps-ip <IP> --vps-port <端口>` | 全六节 |
 | 已配进本 skill 的出站 | 凭据别名 + egress 名 | `ip-audit.sh --node <别名> --egress us1` | 全六节（凭据从 VPS 侧解析，不落本地明文） |
 
-**为什么购买前只能查静态项**：第五、六节要真实向 TikTok / Netflix / ChatGPT / 25 端口发起探测，没有可用的出口 IP 就没有观测点，这不是脚本限制，是物理限制。
+**购买前能查什么、不能查什么**：类型、代理/VPN 标志、原生或广播、rDNS、以及 DNSBL（经 ip.net.coffee 的服务端 API，不走本机 DNS）都可以在只拿一个裸 IP 时查。第五、六节（TikTok / Netflix / ChatGPT / 25 端口）要真实从该 IP 出去探测，没有出口就没有观测点，这不是脚本限制，是物理限制。
 
-### 判定阈值（沿用挑 Webshare IP 时定的标准）
+### 判定阈值
 
 | 指标 | 通过 | 复核 | 放弃 |
 |---|---|---|---|
-| Scamalytics Fraud Score | ≤ 10 | 11–25 | > 25 |
-| IPLogs verdict | `clean` | — | 其它值 |
-| IPQS | 0–10 | 11–75 | > 75（「可疑」档） |
-| 代理 / VPN / Tor / 滥用 / 机器人 | 全部「否/无」 | 单一库阳性可接受 | 多库同时阳性 |
-| IP 类型 | 多数库判「家宽」 | 一半对一半 | 多数判「机房」 |
+| 类型投票（coffee / ipx.al / iping / IPLogs / Scamalytics Server） | ≥ 2 个独立源判 ISP/家宽，且机房票不成多数 | 家宽票不足 2，或与机房票打平 | 机房/IDC 票占多数 |
+| 代理 / VPN / Tor | 全部无 | 单源阳性 | ≥ 2 个源阳性 |
+| Scamalytics Fraud Score | —（≤10 低风险参考） | 11–25 **仅作参考**：类型投票明确为家宽且标志干净时，不单独触发复核 | > 25 |
+| IPLogs verdict | `clean` | 其它值 | — |
+| DNSBL（coffee 服务端） | 未列，或仅 Spamhaus PBL（`127.0.0.10` / `127.0.0.11`，标「PBL（家宽正常）」） | SBL / XBL / CSS 或其他名单命中 | — |
+| 原生 / 广播（ipx.al `native.verdict`、iping `type`） | native | broadcast / 注册地与使用地不一致 | — |
+| AbuseIPDB（可选，需免费 key） | score < 25 且 90 天举报 < 5 | score ≥ 25 或 90 天举报 ≥ 5 | score ≥ 75 |
+| IPQS（仅全量 `ip-audit.sh`） | 0–10 | 11–75 | > 75（「可疑」档） |
 
-`ip-check-lite.sh` 退出码 0 = 可继续下一步，1 = 需要人工复核。过了快查再花钱/花时间跑全量。
+`ip-check-lite.sh` 退出码：0 = 通过，可继续下一步；1 = 需人工复核；3 = 放弃；2 = 参数错误。任一启用源超时、被拦、解析失败，都至少判复核（fail-closed）。过了快查再花钱/花时间跑全量。
+
+**可选 AbuseIPDB key**：官网注册免费 key（约 1000 次/天）。不要把 key 写进仓库或命令行。
+
+```bash
+install -m 700 -d ~/.vps-node
+install -m 600 /dev/null ~/.vps-node/abuseipdb.key
+# 然后把 key 粘进该文件（单行）。权限必须是 600 或 400，否则脚本会跳过。
+# 或者：export ABUSEIPDB_KEY='...'   # 仅当前 shell，勿写进脚本或 history
+```
+
+未配置时打印 `AbuseIPDB: 未配置 key，跳过`，不因此失败。
 
 ### 三条硬规矩
 
-- **DNSBL 必须跑在 VPS 上**：本机走 Clash TUN 的 fake-ip（198.18.x），DNSBL 查出来全是无效结果。所以 `--proxy` 模式默认经 VPS 转发执行，`--local` 只作应急
+- **本机直接做 DNSBL 查询会失真**：Mac 走 Clash TUN 的 fake-ip（198.18.x）时，本地 DNSBL 结果不可信。所以 `ip-audit.sh --proxy` 默认经 VPS 转发执行，`--local` 只作应急。**例外**：`ip-check-lite.sh` 用的是 ip.net.coffee 的服务端 DNSBL API，查询发生在对方服务器上，购买前体检可以信；其中 Spamhaus PBL（`127.0.0.10` / `11`）是家宽段常见策略名单，不代表这个 IP 脏
 - **`--expect` 不要省**：同一商家多条 IP 时极易搞混（实测出现过两条 IP 只差最后一位、端口还不同的情况），出口 echo 不等于期望值就中止，避免把 A 的报告当成 B 的
 - **报告公开且不可撤回**：`Report.Check.Place` 只露掩码 IP / ASN / 评分，不含完整 IP，但没有删除接口。本地留档在 `~/.vps-node/ipaudits/<出口IP>/`
 
@@ -494,7 +508,7 @@ scp -P <SSH_PORT> scripts/vps-harden.sh root@<IP>:/root/ && ssh -p <SSH_PORT> ro
 bash scripts/vps-external-ip-check.sh <IP> 443
 
 # ---- IP 体检三阶段（详见「IP 体检」一节）----
-# 购买前：只有裸 IP，免注册三源快查
+# 购买前：裸 IP 快查（ipinfo / IPLogs / Scamalytics / coffee / ipx.al / iping，可选 AbuseIPDB）
 bash scripts/ip-check-lite.sh <IP>
 # 购买后·情况一：有代理凭据，经 VPS 转发跑全六节（凭据走 stdin，不进命令行；--expect 必填）
 bash scripts/ip-audit.sh --proxy 'socks5h://user:pass@host:port' --expect <IP> --node <凭据别名>
@@ -531,7 +545,7 @@ bash scripts/repo-lint.sh
 ## 已知限制
 
 - **预检会装 `nexttrace`**：看回程 AS 路径必须有它（mtr 对无 PTR 的跳显示 `AS???`，会把 AS10099 / AS9929 吞掉造成误判）。装不上则退 mtr 并在结论里注明工具名
-- **预检不查 Scamalytics / AbuseIPDB**：这两家要浏览器渲染解析，只在部署后的 `vps-external-ip-check.sh` 里做。预检用 ip-api + proxycheck 两个免费 API 快速判。更新：`ip-check-lite.sh` 已能直接抓 Scamalytics 页面（无需浏览器），但 **AbuseIPDB 免注册页对脚本返回 403**（Cloudflare 挡 curl），只能浏览器手查或注册免费 key（约 5000 次/月）后接进脚本
+- **预检不查 Scamalytics / AbuseIPDB**：这两家要浏览器渲染解析，只在部署后的 `vps-external-ip-check.sh` 里做。预检用 ip-api + proxycheck 两个免费 API 快速判。`ip-check-lite.sh` 已能直接抓 Scamalytics 页面（无需浏览器）；AbuseIPDB 免注册页对 curl 返回 403（Cloudflare），购买前快查可选用免费 API key（约 1000 次/天，见「IP 体检」一节）
 - **预检判 FAIL 可用 `FORCE=1` 强推**：比如你明知道是 OpenVZ 但仍要装（BBR 用不了）、或 443 被自己另一个服务占着。强推时警告照样打印
 - **Hysteria2 的 UDP 8443 无法自动验证**，只能靠实际连通判断
 - 体检里的 ipinfo / Scamalytics / AbuseIPDB 依赖本机 Clash 代理 + Chrome headless；代理端口自动探测（7897/7890/7891/1087），可用 `IPCHECK_PROXY=` 覆盖

@@ -12,6 +12,7 @@ creds.json
 .gateway.json
 *.pem
 *.key
+abuseipdb.key
 id_ed25519*
 id_rsa*
 .github/sensitive-blocklist.local.txt
