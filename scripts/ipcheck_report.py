@@ -9,12 +9,13 @@ import socket
 import subprocess
 import sys
 import time
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
 UNLOCK_SERVICES = [
@@ -1232,59 +1233,285 @@ def check_chatgpt(cfg=None):
 
 
 
-def check_claude(cfg=None):
-    """Lightweight Claude geo check: claude.ai unavailable-in-region / 403."""
-    method = _dns_method("claude.ai")
-    rc, out, err = _curl(
-        ["-w", "\n__HTTP__:%{http_code} %{url_effective}", "https://claude.ai/"],
-        timeout=12, cfg=cfg,
+
+def fmt_vote(n):
+    """投票数展示：整数不带小数，半票写成 3.5。"""
+    if n is None or n == "?":
+        return "?"
+    try:
+        x = float(n)
+    except (TypeError, ValueError):
+        return str(n)
+    if abs(x - round(x)) < 1e-9:
+        return str(int(round(x)))
+    s = ("%.2f" % x).rstrip("0").rstrip(".")
+    return s
+
+
+def is_manual_voter(title):
+    return "手动" in (title or "")
+
+
+def weight_type_votes(type_voters):
+    """手动库类型票常来自同一上游，故每票 0.5，总权重不超过实时源，净贡献不超过 ±2。
+
+    type_voters: iterable of (title, vote, note)，vote 为 'res' 或 'host'。
+    返回 residential/hosting（加权后）及 live/manual 分解。
+    """
+    live_res = live_host = 0
+    man_res = man_host = 0
+    for item in type_voters or []:
+        if not item:
+            continue
+        title = item[0] if not isinstance(item, dict) else (item.get("title") or item.get("source"))
+        vote = item[1] if not isinstance(item, dict) else item.get("vote")
+        if vote == "res":
+            if is_manual_voter(title):
+                man_res += 1
+            else:
+                live_res += 1
+        elif vote == "host":
+            if is_manual_voter(title):
+                man_host += 1
+            else:
+                live_host += 1
+    live_n = live_res + live_host
+    w_res, w_host = man_res * 0.5, man_host * 0.5
+    total_w = w_res + w_host
+    if live_n > 0 and total_w > live_n:
+        scale = float(live_n) / total_w
+        w_res *= scale
+        w_host *= scale
+    net = w_res - w_host
+    if net > 2:
+        w_res = w_host + 2
+    elif net < -2:
+        w_host = w_res + 2
+    return {
+        "residential": live_res + w_res,
+        "hosting": live_host + w_host,
+        "live_residential": live_res,
+        "live_hosting": live_host,
+        "manual_residential": w_res,
+        "manual_hosting": w_host,
+        "manual_raw": {"residential": man_res, "hosting": man_host},
+    }
+
+
+def is_cloudflare_challenge(headers="", body="", err=""):
+    hdr = headers or ""
+    if re.search(r"(?im)^cf-mitigated\s*:", hdr) or re.search(r"(?i)cf-mitigated\s*:", hdr):
+        return True
+    blob = "\n".join([hdr, body or "", err or ""]).lower()
+    if "just a moment" in blob:
+        return True
+    if "challenge-platform" in blob or "cdn-cgi/challenge-platform" in blob:
+        return True
+    return False
+
+
+def is_claude_region_block(body="", url=""):
+    blob = ((body or "") + "\n" + (url or "")).lower()
+    markers = (
+        "app-unavailable-in-region",
+        "unavailable-in-region",
+        "not available in your country",
+        "isn't available in your country",
+        "is not available in your country",
+        "unsupported-country",
+        "unsupported_country",
     )
-    text = (out or "") + "\n" + (err or "")
-    low = text.lower()
-    code, url = "000", ""
-    m = re.search(r"__HTTP__:(\d{3})\s+(\S+)", text)
-    if m:
-        code, url = m.group(1), m.group(2)
-    blocked = any(s in low or s in (url or "").lower() for s in (
-        "app-unavailable-in-region", "not available in your country",
-        "isn't available in your country", "is not available in your country",
-        "unavailable-in-region", "/unavailable", "blocked-in-region",
-    ))
-    if blocked or code == "403":
+    return any(s in blob for s in markers)
+
+
+def _path_has_segment(url, segment):
+    if not url:
+        return False
+    try:
+        from urllib.parse import urlparse
+        path = urlparse(url).path or ""
+    except Exception:
+        path = url
+    parts = [p for p in path.lower().split("/") if p]
+    return segment.lower() in parts
+
+
+def is_gemini_region_block(body="", url=""):
+    """不要用 UnavailableSurface-*.js 这类文件名当屏蔽。"""
+    blob = (body or "").lower()
+    url_l = (url or "").lower()
+    phrases = (
+        "not available in your country",
+        "isn't available in your country",
+        "is not available in your country",
+        "unavailable in your country",
+        "country_unavailable",
+        "gemini is not available",
+    )
+    if any(s in blob or s in url_l for s in phrases):
+        return True
+    # 仅当生效 URL 的路径段就是 unavailable，而不是 JS 文件名
+    if _path_has_segment(url, "unavailable"):
+        return True
+    return False
+
+
+def _is_public_ipv4(ip):
+    try:
+        o = [int(x) for x in str(ip).split(".")]
+        if len(o) != 4 or any(x < 0 or x > 255 for x in o):
+            return False
+    except (TypeError, ValueError):
+        return False
+    a, b = o[0], o[1]
+    if a == 0 or a == 127 or a >= 224:
+        return False
+    if a == 10 or (a == 192 and b == 168) or (a == 172 and 16 <= b <= 31):
+        return False
+    if a == 169 and b == 254:
+        return False
+    if a == 100 and 64 <= b <= 127:
+        return False
+    if a == 198 and 18 <= b <= 19:
+        return False
+    return True
+
+
+def list_local_ipv4():
+    ips = []
+    found = set()
+
+    def _add(ip):
+        if ip and ip not in found and re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
+            found.add(ip)
+            ips.append(ip)
+
+    for cmd in (
+        ["ip", "-4", "-o", "addr", "show"],
+        ["ifconfig", "-a"],
+        ["hostname", "-I"],
+    ):
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4)
+            text = p.stdout.decode("utf-8", "replace") if p.returncode == 0 else ""
+        except Exception:
+            text = ""
+        if not text:
+            continue
+        for m in re.finditer(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", text):
+            _add(m.group(1))
+        if ips and cmd[0] in ("ip", "ifconfig"):
+            break
+    try:
+        host = socket.gethostname()
+        for item in socket.getaddrinfo(host, None, socket.AF_INET):
+            _add(item[4][0])
+    except Exception:
+        pass
+    return ips
+
+
+def should_test_local_port25():
+    """本机 25 端口探测只在真正的公网 VPS 上有意义；macOS 或接口上没有公网 IPv4 则不测。"""
+    if sys.platform == "darwin":
+        return False
+    return any(_is_public_ipv4(ip) for ip in list_local_ipv4())
+
+
+
+
+def _curl_http(url, timeout=12, cfg=None, extra=None):
+    """GET url，同时拿状态码、生效 URL、响应头和正文。"""
+    fd, hpath = tempfile.mkstemp(prefix="ipcheck-hdr-")
+    os.close(fd)
+    try:
+        args = list(extra or [])
+        args += ["-D", hpath, "-w", "\n__HTTP__:%{http_code} %{url_effective}", url]
+        rc, out, err = _curl(args, timeout=timeout, cfg=cfg)
+        body = out or ""
+        code, final = "000", url
+        m = re.search(r"\n__HTTP__:(\d{3})\s+(\S+)\s*$", body)
+        if m:
+            code, final = m.group(1), m.group(2)
+            body = body[:m.start()]
+        try:
+            headers = open(hpath, encoding="utf-8", errors="replace").read()
+        except OSError:
+            headers = ""
+        return {"rc": rc, "code": code, "url": final, "headers": headers, "body": body, "err": err or ""}
+    finally:
+        try:
+            os.remove(hpath)
+        except OSError:
+            pass
+
+
+def check_claude(cfg=None):
+    """Claude 地理可用性。Cloudflare 挑战的 403 记「未知」，只有明确区域不可用才算屏蔽。"""
+    method = _dns_method("claude.ai")
+    login = _curl_http("https://claude.ai/login", timeout=12, cfg=cfg)
+    home = _curl_http("https://claude.ai/", timeout=12, cfg=cfg)
+    # 区域封锁证据优先
+    if is_claude_region_block(home.get("body"), home.get("url")):
+        res = home
+    elif is_claude_region_block(login.get("body"), login.get("url")):
+        res = login
+    elif home.get("code", "").startswith(("2", "3")) and not is_cloudflare_challenge(
+        home.get("headers"), home.get("body"), home.get("err")
+    ):
+        res = home
+    else:
+        res = login
+    body, url, headers, err, code, rc = (
+        res.get("body") or "", res.get("url") or "", res.get("headers") or "",
+        res.get("err") or "", res.get("code") or "000", res.get("rc"),
+    )
+    if is_claude_region_block(body, url):
         return {"name": "Claude", "status": "屏蔽", "region": "—", "method": "—"}
-    if rc != 0 and code in ("000", "000"):
-        return {"name": "Claude", "status": "失败", "region": "—", "method": "—"}
+    api = _curl_http("https://api.anthropic.com/", timeout=8, cfg=cfg)
+    api_reachable = (api.get("code") == "405")
+    cf = (
+        is_cloudflare_challenge(headers, body, err)
+        or is_cloudflare_challenge(login.get("headers"), login.get("body"), login.get("err"))
+        or is_cloudflare_challenge(home.get("headers"), home.get("body"), home.get("err"))
+    )
+    if cf or (code == "403" and ("cloudflare" in (headers + body + err).lower() or cf)):
+        return {
+            "name": "Claude", "status": "未知（Cloudflare 挑战）", "region": "—", "method": "—",
+            "note": "api.anthropic.com 可达" if api_reachable else None,
+        }
+    if code == "403":
+        return {"name": "Claude", "status": "未知", "region": "—", "method": "—"}
     if code.startswith("2") or code.startswith("3"):
         return {"name": "Claude", "status": "解锁", "region": "—", "method": method}
+    if api_reachable:
+        return {"name": "Claude", "status": "未知", "region": "—", "method": "—", "note": "api.anthropic.com 可达"}
+    if rc != 0 and code in ("000",):
+        return {"name": "Claude", "status": "失败", "region": "—", "method": "—"}
     return {"name": "Claude", "status": "失败", "region": "—", "method": "—"}
 
 
 def check_gemini(cfg=None):
-    """Lightweight Gemini geo check on gemini.google.com."""
+    """Gemini 地理可用性。不把 UnavailableSurface-*.js 这类文件名当成屏蔽。"""
     method = _dns_method("gemini.google.com")
-    rc, out, err = _curl(
-        ["-w", "\n__HTTP__:%{http_code} %{url_effective}", "https://gemini.google.com/"],
-        timeout=12, cfg=cfg,
+    res = _curl_http("https://gemini.google.com/app", timeout=12, cfg=cfg)
+    if not (res.get("body") or res.get("code") not in ("000", None, "")):
+        res = _curl_http("https://gemini.google.com/", timeout=12, cfg=cfg)
+    body, url, headers, err, code, rc = (
+        res.get("body") or "", res.get("url") or "", res.get("headers") or "",
+        res.get("err") or "", res.get("code") or "000", res.get("rc"),
     )
-    text = (out or "") + "\n" + (err or "")
-    low = text.lower()
-    code, url = "000", ""
-    m = re.search(r"__HTTP__:(\d{3})\s+(\S+)", text)
-    if m:
-        code, url = m.group(1), m.group(2)
-    blocked = any(s in low or s in (url or "").lower() for s in (
-        "not available in your country", "isn't available in your country",
-        "is not available in your country", "unavailable in your country",
-        "country_unavailable", "/unavailable", "gemini is not available",
-    ))
-    if blocked or code == "403":
+    if is_gemini_region_block(body, url):
         return {"name": "Gemini", "status": "屏蔽", "region": "—", "method": "—"}
+    if is_cloudflare_challenge(headers, body, err):
+        return {"name": "Gemini", "status": "未知（Cloudflare 挑战）", "region": "—", "method": "—"}
+    if code == "403":
+        return {"name": "Gemini", "status": "未知", "region": "—", "method": "—"}
     if rc != 0 and code in ("000",):
         return {"name": "Gemini", "status": "失败", "region": "—", "method": "—"}
     if code.startswith("2") or code.startswith("3"):
         return {"name": "Gemini", "status": "解锁", "region": "—", "method": method}
-    return {"name": "Gemini", "status": "失败", "region": "—", "method": "—"}
-
+    return {"name": "Gemini", "status": "未知", "region": "—", "method": "—"}
 
 
 def check_disney(cfg=None):
@@ -1325,6 +1552,12 @@ def check_remote25(cfg=None):
         return "可达" if "220" in data else "不可达"
     except Exception:
         return "不可达"
+
+
+def check_local25():
+    if not should_test_local_port25():
+        return "仅 VPS 上可测"
+    return check_remote25(cfg=None)
 
 
 def run_unlock(target_ip, mode, cfg_path=None):
@@ -2039,9 +2272,9 @@ def format_compare_section_tables(rows):
     hdr = "| IP | 代理 | Tor | VPN | 服务器 | 滥用 | 机器人 |"
     lines = []
     for r in rows:
-        fac = [x for x in (sec(r).get("factors") or []) if x.get("status") == "ok"]
+        fac = [x for x in (sec(r).get("factors") or []) if x.get("status") in ("ok", "manual")]
         def cnt(k):
-            return sum(1 for x in fac if x.get(k) == "是")
+            return sum(1 for x in fac if str(x.get(k) or "").replace("（手动）", "") == "是")
         lines.append("| %s | %s | %s | %s | %s | %s | %s |" % (
             ip_of(r), cnt("proxy"), cnt("tor"), cnt("vpn"), cnt("server"), cnt("abuser"), cnt("robot")))
     add_table("四、风险因子（是=阳性库数）", hdr, lines)
@@ -2141,7 +2374,7 @@ def parse_note_unlock(spec):
         else:
             status = NOTE_STATUS_MAP.get(val_l) or NOTE_STATUS_MAP.get(raw_v.strip())
             if not status:
-                m = re.match(r"^(解锁|屏蔽|仅自制|仅APP|仅网页|失败|未测)(?:[（(/]+(原生|DNS|dns|手动)?", raw_v.strip())
+                m = re.match(r"^(解锁|屏蔽|仅自制|仅APP|仅网页|失败|未测|未知)(?:[（(/]+(原生|DNS|dns|手动)?", raw_v.strip())
                 if m:
                     status = m.group(1)
                     if m.group(2):
@@ -2514,7 +2747,7 @@ def manual_flag_voters(db):
             # 标题要让 _flag_kind 识别出高权重源
             title = {"ipqs": "IPQS", "ipquality": "IPQS", "scamalytics": "Scamalytics",
                      "ipinfo": "IPinfo", "ipregistry": "ipregistry", "ipdata": "ipdata",
-                     "iplogs": "IPLogs"}.get(key, key)
+                     "iplogs": "IPLogs", "ip2location": "IP2Location"}.get(key, key)
             out.append((title, flags))
     return out
 
@@ -2729,17 +2962,15 @@ def apply_manual_factors(rows, db):
             rows.append(r)
             by[dbn] = r
             continue
-        fillable = r.get("status") in ("no_key", "fail", "no_data", "no_credits", "error")
+        # 手动字段覆盖免费层（例如 IP2Location 免费层只有 is_proxy，截图来自完整库）
         for f in ("proxy", "tor", "vpn", "server", "abuser", "robot"):
             if fields[f] is None:
                 continue
-            cur = r.get(f)
-            if fillable or cur in (None, "", "—", "未配置"):
-                r[f] = _tag_manual(fields[f])
+            r[f] = _tag_manual(fields[f])
         if "手动" not in (r.get("note") or ""):
             r["note"] = ((r.get("note") + "；") if r.get("note") else "") + "手动记录"
-            if fillable:
-                r["status"] = "manual"
+        if r.get("status") in ("no_key", "fail", "no_data", "no_credits", "error", None):
+            r["status"] = "manual"
     return rows
 
 
@@ -2869,6 +3100,8 @@ def _ai_status(unlock, name):
     st = (_svc(unlock, name) or {}).get("status") or "未测"
     if st in ("未测", "失败", "—", "", None):
         return None
+    if str(st).startswith("未知"):
+        return None
     return st
 
 
@@ -2876,27 +3109,94 @@ def has_ai_unlock_data(unlock):
     return any(_ai_status(unlock, n) for n in ("ChatGPT", "Claude", "Gemini"))
 
 
-def _flag_kind(title):
+def ip2_risk_from(notes_db, extras=None):
+    rec = (notes_db or {}).get("ip2location") or {}
+    if rec.get("risk") is not None:
+        try:
+            return float(rec["risk"]), "manual"
+        except (TypeError, ValueError):
+            pass
+    d = ((extras or {}).get("ip2location") or {}).get("data") or {}
+    if d.get("fraud_score") is not None:
+        try:
+            return float(d["fraud_score"]), "live"
+        except (TypeError, ValueError):
+            pass
+    return None, None
+
+
+def ip2_has_anon(notes_db, flag_voters=None):
+    rec = (notes_db or {}).get("ip2location") or {}
+    if rec.get("proxy") or rec.get("vpn") or rec.get("tor"):
+        return True
+    for item in flag_voters or []:
+        title = item[0] if not isinstance(item, dict) else (item.get("source") or item.get("title"))
+        flags = item[1] if not isinstance(item, dict) else (item.get("flags") or [])
+        if "ip2location" in (title or "").lower() and any(f in ("proxy", "vpn", "tor") for f in (flags or [])):
+            return True
+    return False
+
+
+def ip2_risk_bits(risk, has_anon, source=""):
+    """IP2Location ≥75 且 proxy/VPN：与 IPQS 同类，高权重并建议放弃。"""
+    if risk is None:
+        return 0, None, None
+    try:
+        n = float(risk)
+    except (TypeError, ValueError):
+        return 0, None, None
+    tag = "（手动）" if source == "manual" else ""
+    disp = ("%g" % n)
+    if n >= 75 and has_anon:
+        return -20, "IP2Location %s 高风险且 proxy/VPN%s" % (disp, tag), (
+            "IP2Location risk %s 且标记 proxy/VPN，建议放弃%s" % (disp, tag)
+        )
+    if n >= 75:
+        return -10, "IP2Location %s 高风险%s" % (disp, tag), None
+    return 0, None, None
+
+
+def _flag_kind(title, weight=None, ip2_risk=None):
+    if weight == "high":
+        return "high"
+    if weight == "low":
+        return "low"
     t = (title or "").lower()
     for h in HIGH_FLAG_SOURCES:
         if h in t:
             return "high"
+    # IP2Location 风险 ≥75 且已作为代理/VPN 旗（由调用方保证）→ 高权重，与 IPQS 同类
+    if "ip2location" in t or t == "ip2":
+        try:
+            if ip2_risk is not None and float(ip2_risk) >= 75:
+                return "high"
+        except (TypeError, ValueError):
+            pass
     return "low"
 
 
-def _flags_from_row(flags):
-    """Return (high_n, low_n, labels). flags is JSON list of {source, flags}."""
+def flag_entry_weight(title, flags=None, notes_db=None, ip2_risk=None):
+    risk = ip2_risk
+    if risk is None and notes_db is not None:
+        risk, _src = ip2_risk_from(notes_db)
+    return _flag_kind(title, ip2_risk=risk)
+
+
+def _flags_from_row(flags, ip2_risk=None):
+    """Return (high_n, low_n, labels). flags is JSON list of {source, flags, weight?}."""
     high = low = 0
     labels = []
     for item in flags or []:
         if isinstance(item, dict):
             title = item.get("source") or item.get("title") or ""
             fl = item.get("flags") or []
+            weight = item.get("weight")
+            item_risk = item.get("risk") if item.get("risk") is not None else ip2_risk
         else:
-            title, fl = str(item), ["flag"]
+            title, fl, weight, item_risk = str(item), ["flag"], None, ip2_risk
         if not fl:
             continue
-        kind = _flag_kind(title)
+        kind = _flag_kind(title, weight=weight, ip2_risk=item_risk)
         if kind == "high":
             high += 1
         else:
@@ -2908,7 +3208,21 @@ def _flags_from_row(flags):
 def score_ai_use(row):
     """AI 适用分 0-100. row 可以是 lite JSON，或现场拼好的同名字段。"""
     flags = row.get("flags") or []
-    high_n, low_n, flag_labs = _flags_from_row(flags)
+    ip2_risk = row.get("ip2location_risk")
+    if ip2_risk is None:
+        rec = ((row.get("manual_notes") or {}).get("db") or {}).get("ip2location") or {}
+        if rec.get("risk") is not None:
+            ip2_risk = rec.get("risk")
+        else:
+            for s in ((row.get("sections") or {}).get("scores") or []):
+                if s.get("db") == "IP2Location" and s.get("score") not in (None, "", "—"):
+                    raw = str(s.get("score")).replace("（手动）", "").strip()
+                    try:
+                        ip2_risk = float(raw)
+                    except (TypeError, ValueError):
+                        pass
+                    break
+    high_n, low_n, flag_labs = _flags_from_row(flags, ip2_risk=ip2_risk)
     scam = row.get("scamalytics_score")
     try:
         scam = int(scam) if scam is not None else None
@@ -2916,13 +3230,13 @@ def score_ai_use(row):
         scam = None
     tv = row.get("type_votes") or {}
     try:
-        res_n = int(tv.get("residential") or 0)
+        res_n = float(tv.get("residential") or 0)
     except (TypeError, ValueError):
-        res_n = 0
+        res_n = 0.0
     try:
-        host_n = int(tv.get("hosting") or 0)
+        host_n = float(tv.get("hosting") or 0)
     except (TypeError, ValueError):
-        host_n = 0
+        host_n = 0.0
     host_majority = host_n > res_n and host_n >= 2
 
     dnsbl_hits = row.get("dnsbl_hits") or []
@@ -3007,11 +3321,11 @@ def score_ai_use(row):
     if host_n == 0:
         p_ho, d_ho = 15, "机房 0 票"
     elif host_majority:
-        p_ho, d_ho = 0, "机房多数 %d:%d" % (res_n, host_n)
+        p_ho, d_ho = 0, "机房多数 %s:%s" % (fmt_vote(res_n), fmt_vote(host_n))
     elif host_n >= 2:
-        p_ho, d_ho = 12, "家宽 %d : 机房 %d（轻扣）" % (res_n, host_n)
+        p_ho, d_ho = 12, "家宽 %s : 机房 %s（轻扣）" % (fmt_vote(res_n), fmt_vote(host_n))
     else:
-        p_ho, d_ho = 13, "家宽 %d : 机房 %d" % (res_n, host_n)
+        p_ho, d_ho = 13, "家宽 %s : 机房 %s" % (fmt_vote(res_n), fmt_vote(host_n))
 
     # ----- 登记/rDNS 5：很轻 -----
     p_reg = 5
@@ -3128,9 +3442,9 @@ def score_ai_use(row):
         else:
             reasons.append("IPQS %d" % ipqs_score)
     if host_majority:
-        reasons.append("机房多数 %d:%d" % (res_n, host_n))
+        reasons.append("机房多数 %s:%s" % (fmt_vote(res_n), fmt_vote(host_n)))
     elif host_n >= 2:
-        reasons.append("机房票 %d:%d" % (res_n, host_n))
+        reasons.append("机房票 %s:%s" % (fmt_vote(res_n), fmt_vote(host_n)))
     if bits:
         reasons.extend(bits)
 

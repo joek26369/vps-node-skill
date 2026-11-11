@@ -455,8 +455,8 @@ def op_cell(r):
 
 def type_cell(r):
     tv = r.get("type_votes") or {}
-    res = tv.get("residential", "?")
-    host = tv.get("hosting", "?")
+    res = ipr.fmt_vote(tv.get("residential")) if tv.get("residential") is not None else "?"
+    host = ipr.fmt_vote(tv.get("hosting")) if tv.get("hosting") is not None else "?"
     extra = ""
     if tv.get("bonus_applied"):
         extra = "+1"
@@ -618,7 +618,7 @@ def only_source_failure(r):
         return False
     tv = r.get("type_votes") or {}
     try:
-        host = int(tv.get("hosting") or 0)
+        host = float(tv.get("hosting") or 0)
     except (TypeError, ValueError):
         host = 0
     if host >= 2:

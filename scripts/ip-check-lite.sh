@@ -59,7 +59,7 @@
 # ============================================================================
 set -uo pipefail
 
-UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 KEYFILE="${HOME}/.vps-node/abuseipdb.key"
 ABUSEIPDB_KEY="${ABUSEIPDB_KEY:-}"
 
@@ -378,7 +378,16 @@ fetch_one() {
   : > "$errf"
   printf '000' > "$codef"
   local http
-  http=$(curl -sS -o "$body" -w '%{http_code}' --max-time "$t" -L -A "$UA" "$url" 2>"$errf") || true
+  # ipinfo 免费层对不完整 UA / 缺少 Accept: application/json 会回 406；路径必须是 /json
+  local accept=()
+  if [ "$name" = "ipinfo" ]; then
+    case "$url" in
+      */json|*/json[?]*) ;;
+      *) url="${url%/}/json" ;;
+    esac
+    accept=(-H "Accept: application/json")
+  fi
+  http=$(curl -sS -o "$body" -w '%{http_code}' --max-time "$t" -L -A "$UA" "${accept[@]}" "$url" 2>"$errf") || true
   [ -n "$http" ] || http=000
   printf '%s' "$http" > "$codef"
 }
@@ -522,8 +531,8 @@ KEY_IPDATA=0
 KEY_DBIP=0
 if [ -n "${IPINFO_TOKEN:-}" ]; then
   KEY_IPINFO=1
-  fetch_keyed ipinfo "https://ipinfo.io/${IP}/json" 15 "user = \"${IPINFO_TOKEN}:\""
-  fetch_keyed ipinfo_full "https://ipinfo.io/${IP}/json?fields=ip,city,region,country,loc,org,postal,timezone,privacy,asn,company,abuse" 15 "user = \"${IPINFO_TOKEN}:\""
+  fetch_keyed ipinfo "https://ipinfo.io/${IP}/json" 15 "$(printf 'header = "Accept: application/json"\nuser = "%s:"' "${IPINFO_TOKEN}")"
+  fetch_keyed ipinfo_full "https://ipinfo.io/${IP}/json?fields=ip,city,region,country,loc,org,postal,timezone,privacy,asn,company,abuse" 15 "$(printf 'header = "Accept: application/json"\nuser = "%s:"' "${IPINFO_TOKEN}")"
 fi
 if [ -n "${IPREGISTRY_KEY:-}" ]; then
   KEY_IPREGISTRY=1
@@ -1377,11 +1386,14 @@ for title, flags in ipr.manual_flag_voters(notes_db):
         flag_voters.append((title, flags))
         _flag_idx[b] = len(flag_voters) - 1
 
-res_n = sum(1 for _, v, _ in type_voters if v == "res")
-host_n = sum(1 for _, v, _ in type_voters if v == "host")
+# 手动库类型票权重 0.5，且不超过实时源、净贡献不超过 2（避免同源截图把机房多数翻成家宽多数）
+_vw = ipr.weight_type_votes(type_voters)
+res_n = _vw["residential"]
+host_n = _vw["hosting"]
 host_sources = [title for title, v, _ in type_voters if v == "host"]
 host_src_txt = "、".join(host_sources)
 flag_sources_n = len(flag_voters)
+fv = ipr.fmt_vote
 
 failed = [s for s in sources.values() if s["enabled"] and not s["ok"]]
 
@@ -1533,19 +1545,19 @@ type_pass = (res_eff >= 2 and res_eff > host_n)
 host_majority = (host_n > res_n and host_n >= 2)
 if host_majority:
     # 机房多数按原始票数判断，加分不得覆盖
-    reject.append("类型投票：机房/IDC %d 票 vs 家宽/ISP %d 票，多数源判机房（%s），建议放弃" % (host_n, res_n, host_src_txt or "—"))
+    reject.append("类型投票：机房/IDC %s 票 vs 家宽/ISP %s 票，多数源判机房（%s），建议放弃" % (fv(host_n), fv(res_n), host_src_txt or "—"))
 elif not type_pass:
-    review.append("类型投票未通过（家宽/ISP %d 票，机房/IDC %d 票；通过需至少 2 票家宽且多于机房票）" % (res_eff, host_n))
+    review.append("类型投票未通过（家宽/ISP %s 票，机房/IDC %s 票；通过需至少 2 票家宽且多于机房票）" % (fv(res_eff), fv(host_n)))
     if host_n >= 2:
-        review.append("有 %d 个源判机房（%s）" % (host_n, host_src_txt))
+        review.append("有 %s 个源判机房（%s）" % (fv(host_n), host_src_txt))
 else:
     if bonus_applied and res_n < 2:
-        notes.append("类型投票通过：家宽/ISP %d 票 + 主流运营商加分，机房/IDC %d 票" % (res_n, host_n))
+        notes.append("类型投票通过：家宽/ISP %s 票 + 主流运营商加分，机房/IDC %s 票" % (fv(res_n), fv(host_n)))
     else:
-        notes.append("类型投票通过：家宽/ISP %d 票，机房/IDC %d 票" % (res_n, host_n))
+        notes.append("类型投票通过：家宽/ISP %s 票，机房/IDC %s 票" % (fv(res_n), fv(host_n)))
     # 家宽仍占多数，但已有 ≥2 个源判机房（含仅多 1 票）→ 至少复核，不放弃
     if host_n >= 2:
-        review.append("有 %d 个源判机房（%s），即使家宽仍占多数，也需复核" % (host_n, host_src_txt))
+        review.append("有 %s 个源判机房（%s），即使家宽仍占多数，也需复核" % (fv(host_n), host_src_txt))
 
 # 代理/VPN/Tor
 if flag_sources_n >= 2:
@@ -1592,6 +1604,44 @@ if _ipqs_reject:
     reject.append(_ipqs_reject)
 elif _ipqs_review:
     review.append(_ipqs_review)
+
+# IPQS ≥75 且 proxy/VPN → 放弃；真实 DNSBL 命中 + 另一高权重标志 → 放弃
+def _ipqs_anon():
+    rec = (notes_db.get("ipqs") or {})
+    if rec.get("proxy") or rec.get("vpn") or rec.get("tor"):
+        return True
+    for title, flags in flag_voters:
+        if "ipqs" in (title or "").lower() or "ipquality" in (title or "").lower():
+            if any(f in ("proxy", "vpn", "tor") for f in (flags or [])):
+                return True
+    return False
+
+def _has_high_flag():
+    for title, flags in flag_voters:
+        if flags and ipr.flag_entry_weight(title, flags, notes_db=notes_db) == "high":
+            return True
+    return False
+
+ip2_risk, ip2_src = ipr.ip2_risk_from(notes_db)
+_ip2_anon = ipr.ip2_has_anon(notes_db, flag_voters)
+_ip2_pts, _ip2_review, _ip2_reject = ipr.ip2_risk_bits(ip2_risk, _ip2_anon, ip2_src or "")
+if _ip2_reject:
+    if _ip2_reject not in reject:
+        reject.append(_ip2_reject)
+elif _ip2_review:
+    if _ip2_review not in review:
+        review.append(_ip2_review)
+
+if ipqs_score is not None and ipqs_score >= 75 and _ipqs_anon():
+    tag = "（手动）" if ipqs_src == "manual" else ""
+    msg = "IPQS %d 且标记 proxy/VPN，建议放弃%s" % (ipqs_score, tag)
+    if msg not in reject:
+        reject.append(msg)
+_real_listed = (manual_listed > 0) or bool((sources.get("coffee") or {}).get("_dnsbl_hits"))
+if _real_listed and _has_high_flag():
+    msg = "DNSBL 黑名单命中且另有高权重代理/VPN 标记，建议放弃"
+    if msg not in reject:
+        reject.append(msg)
     if cof.get("_dnsbl_pbl"):
         notes.append("%s —— 家宽段常见，不视为不干净" % "; ".join(cof["_dnsbl_pbl"]))
 
@@ -1739,9 +1789,9 @@ for name, s in sources.items():
 
 print()
 if bonus_applied:
-    print("类型投票合计: 家宽/ISP %d+1加分=%d  |  机房/IDC %d  |  投票源 %d" % (res_n, res_eff, host_n, len(type_voters)))
+    print("类型投票合计: 家宽/ISP %s+1加分=%s  |  机房/IDC %s  |  投票源 %d（手动票权重 0.5，已封顶）" % (fv(res_n), fv(res_eff), fv(host_n), len(type_voters)))
 else:
-    print("类型投票合计: 家宽/ISP %d  |  机房/IDC %d  |  投票源 %d" % (res_n, host_n, len(type_voters)))
+    print("类型投票合计: 家宽/ISP %s  |  机房/IDC %s  |  投票源 %d（手动票权重 0.5，已封顶）" % (fv(res_n), fv(host_n), len(type_voters)))
 if type_voters:
     for title, vote, note in type_voters:
         lab = "家宽" if vote == "res" else "机房"
@@ -1784,18 +1834,18 @@ def pick_first(*vals):
 def pts_type():
     # 0-35
     if host_majority:
-        return 0, "机房多数 %d:%d" % (res_n, host_n)
+        return 0, "机房多数 %s:%s" % (fv(res_n), fv(host_n))
     if res_eff >= 2 and host_n == 0:
-        return 35, "家宽 %d : 机房 0" % res_n
+        return 35, "家宽 %s : 机房 0" % fv(res_n)
     if type_pass and host_n >= 2:
-        return 15, "家宽 %d : 机房 %d（机房票偏多，需复核）" % (res_n, host_n)
+        return 15, "家宽 %s : 机房 %s（机房票偏多，需复核）" % (fv(res_n), fv(host_n))
     if type_pass and host_n > 0:
-        return 25, "家宽 %d : 机房 %d（仍通过）" % (res_n, host_n)
+        return 25, "家宽 %s : 机房 %s（仍通过）" % (fv(res_n), fv(host_n))
     if res_eff > host_n:
-        return 15, "家宽占优但未达通过线 %d:%d" % (res_eff, host_n)
+        return 15, "家宽占优但未达通过线 %s:%s" % (fv(res_eff), fv(host_n))
     if res_n == host_n and (res_n + host_n) > 0:
-        return 8, "打平 %d:%d" % (res_n, host_n)
-    return 5, "家宽 %d : 机房 %d" % (res_n, host_n)
+        return 8, "打平 %s:%s" % (fv(res_n), fv(host_n))
+    return 5, "家宽 %s : 机房 %s" % (fv(res_n), fv(host_n))
 
 def pts_bonus():
     if bonus_applied:
@@ -1943,6 +1993,13 @@ if p_ab is not None:
     score_total += p_ab
 if ipqs_score is not None:
     score_total += p_ipqs
+p_ip2, d_ip2 = _ip2_pts, None
+if ip2_risk is not None:
+    p_ip2, _r2, _j2 = ipr.ip2_risk_bits(ip2_risk, _ip2_anon, ip2_src or "")
+    d_ip2 = _r2 or ("score=%s%s" % (("%g" % ip2_risk), "（手动）" if ip2_src == "manual" else ""))
+    score_total += p_ip2
+else:
+    p_ip2, d_ip2 = 0, "未配置/无可用数据，不计入"
 if score_total < 0:
     score_total = 0
 if score_total > 100:
@@ -1966,6 +2023,10 @@ if ipqs_score is not None:
     breakdown.append(("IPQS", p_ipqs, 0, d_ipqs))
 else:
     breakdown.append(("IPQS", 0, 0, d_ipqs))
+if ip2_risk is not None:
+    breakdown.append(("IP2Location", p_ip2, 0, d_ip2))
+else:
+    breakdown.append(("IP2Location", 0, 0, "未配置/无可用数据，不计入"))
 
 # 复核原因：源失败 vs 真实信号。仅当完全没有实际信号时，才写「仅检测源失败」。
 src_fail_reviews = [x for x in review if "启用源失败" in x or "fail-closed" in x]
@@ -1975,9 +2036,9 @@ failed_names = "、".join(s["title"] for s in failed)
 def real_signal_phrases():
     phrases = []
     if host_n >= 2:
-        phrases.append("有 %d 个源判机房（%s）" % (host_n, host_src_txt or "—"))
+        phrases.append("有 %s 个源判机房（%s）" % (fv(host_n), host_src_txt or "—"))
     elif (not type_pass) and (not host_majority):
-        phrases.append("类型投票未通过（家宽 %d : 机房 %d）" % (res_eff, host_n))
+        phrases.append("类型投票未通过（家宽 %s : 机房 %s）" % (fv(res_eff), fv(host_n)))
     sc0 = sources["scamalytics"]
     sv = (sc0.get("_server") or "") if sc0["ok"] else ""
     if str(sv).lower() in ("yes", "true", "1") and host_n < 2:
@@ -2008,6 +2069,11 @@ def real_signal_phrases():
         phrases.append("IPQS %d %s%s" % (
             ipqs_score, "高风险" if ipqs_score >= 85 else "可疑",
             "（手动）" if ipqs_src == "manual" else ""))
+    if ip2_risk is not None and ip2_risk >= 75:
+        phrases.append("IP2Location %s 高风险%s%s" % (
+            ("%g" % ip2_risk),
+            "且 proxy/VPN" if _ip2_anon else "",
+            "（手动）" if ip2_src == "manual" else ""))
     ab0 = sources["abuseipdb"]
     if ab0["enabled"] and ab0["ok"]:
         try:
@@ -2042,9 +2108,9 @@ def real_signal_phrases():
 
 signal_phrases = real_signal_phrases()
 # 判定依据里还有、但上面没结构化到的实际复核项，补进原因，避免漏信号
-structured_markers = ("有 %d 个源判机房" % host_n, "类型投票未通过", "代理/VPN/Tor",
+structured_markers = ("有 %s 个源判机房" % fv(host_n), "类型投票未通过", "代理/VPN/Tor",
                       "Scamalytics Fraud Score", "Scamalytics 标记", "广播", "非原生",
-                      "DNSBL", "AbuseIPDB", "IPQS", "IPLogs verdict", "rDNS 呈机房",
+                      "DNSBL", "AbuseIPDB", "IPQS", "IP2Location", "IPLogs verdict", "rDNS 呈机房",
                       "登记单位", "转租", "IPXO", "租赁")
 for x in other_reviews:
     if any(m in x for m in structured_markers):
@@ -2078,13 +2144,13 @@ else:
 pros = []
 cons = []
 if res_n >= 2 and host_n == 0:
-    pros.append("类型投票明确为家宽（%d 票，机房 0）" % res_n)
+    pros.append("类型投票明确为家宽（%s 票，机房 0）" % fv(res_n))
 elif type_pass:
-    pros.append("类型投票通过（家宽 %d : 机房 %d）" % (res_n, host_n))
+    pros.append("类型投票通过（家宽 %s : 机房 %s）" % (fv(res_n), fv(host_n)))
 if host_majority:
-    cons.append("多数源判机房（家宽 %d : 机房 %d；%s）" % (res_n, host_n, host_src_txt or "—"))
+    cons.append("多数源判机房（家宽 %s : 机房 %s；%s）" % (fv(res_n), fv(host_n), host_src_txt or "—"))
 elif host_n > 0:
-    cons.append("有 %d 个源判机房（%s）" % (host_n, host_src_txt or "—"))
+    cons.append("有 %s 个源判机房（%s）" % (fv(host_n), host_src_txt or "—"))
 sc_sv = (sources["scamalytics"].get("_server") or "") if sources["scamalytics"]["ok"] else ""
 if str(sc_sv).lower() in ("yes", "true", "1"):
     cons.append("Scamalytics 标记 Server=Yes")
@@ -2130,6 +2196,11 @@ if ipqs_score is not None and ipqs_score >= 75:
     cons.append("IPQS %d %s%s" % (
         ipqs_score, "高风险" if ipqs_score >= 85 else "可疑",
         "（手动）" if ipqs_src == "manual" else ""))
+if ip2_risk is not None and ip2_risk >= 75:
+    cons.append("IP2Location %s 高风险%s%s" % (
+        ("%g" % ip2_risk),
+        "且 proxy/VPN" if _ip2_anon else "",
+        "（手动）" if ip2_src == "manual" else ""))
 elif ipqs_score is not None and ipqs_score == 0:
     pros.append("IPQS 0（手动）" if ipqs_src == "manual" else "IPQS 0")
 if rdns_res:
@@ -2219,8 +2290,12 @@ if mode in ("proxy", "local"):
     print("正在检测出口并跑解锁 / 25 端口...", file=sys.stderr)
     unlock = ipr.run_unlock(IP, mode, cfg_path=proxy_cfg or None)
     if mode == "local":
-        local25 = ipr.check_remote25(cfg=None)
-        remote25 = local25
+        local25 = ipr.check_local25()
+        # 远端 25 在 --local 时与出站探测相同；非 VPS 上本机 25 不测，远端仍按实际探测
+        if local25 == "仅 VPS 上可测":
+            remote25 = ipr.check_remote25(cfg=None)
+        else:
+            remote25 = local25
     elif mode == "proxy":
         remote25 = ipr.check_remote25(cfg=proxy_cfg or None)
 
@@ -2261,13 +2336,17 @@ if sources.get("abuseipdb", {}).get("enabled") and sources["abuseipdb"].get("ok"
         "reports": sources["abuseipdb"].get("_abuse_reports"),
     }
 ai = ipr.score_ai_use({
-    "flags": [{"source": t, "flags": f} for t, f in flag_voters],
+    "flags": [{"source": t, "flags": f, "weight": ipr.flag_entry_weight(t, f, notes_db=notes_db)} for t, f in flag_voters],
     "scamalytics_score": sources["scamalytics"].get("_score") if sources["scamalytics"]["ok"] else None,
     "type_votes": {
         "residential": res_n,
         "hosting": host_n,
         "effective_residential": res_eff,
         "bonus_applied": bool(bonus_applied),
+        "live_residential": _vw.get("live_residential"),
+        "live_hosting": _vw.get("live_hosting"),
+        "manual_residential": _vw.get("manual_residential"),
+        "manual_hosting": _vw.get("manual_hosting"),
     },
     "dnsbl_hits": list(cof.get("_dnsbl_hits") or []),
     "dnsbl_pbl": list(cof.get("_dnsbl_pbl") or []),
@@ -2281,6 +2360,7 @@ ai = ipr.score_ai_use({
     "operator": (op_hit or {}).get("brand") if op_hit else None,
     "unlock": unlock,
     "ipqs_score": ipqs_score,
+    "ip2location_risk": ip2_risk,
     "sections": section_report,
 })
 
@@ -2301,6 +2381,10 @@ for name, got, mx, detail in breakdown:
     elif name == "IPQS" and ipqs_score is None:
         print("  %-16s %4s  %s" % (name, "—", detail))
     elif name == "IPQS":
+        print("  %-16s %+4d  %s" % (name, got, detail))
+    elif name == "IP2Location" and ip2_risk is None:
+        print("  %-16s %4s  %s" % (name, "—", detail))
+    elif name == "IP2Location":
         print("  %-16s %+4d  %s" % (name, got, detail))
     else:
         print("  %-16s %2d/%-2d  %s" % (name, got, mx, detail))
@@ -2359,8 +2443,12 @@ summary = {
         "hosting": host_n,
         "effective_residential": res_eff,
         "bonus_applied": bool(bonus_applied),
+        "live_residential": _vw.get("live_residential"),
+        "live_hosting": _vw.get("live_hosting"),
+        "manual_residential": _vw.get("manual_residential"),
+        "manual_hosting": _vw.get("manual_hosting"),
     },
-    "flags": [{"source": t, "flags": f} for t, f in flag_voters],
+    "flags": [{"source": t, "flags": f, "weight": ipr.flag_entry_weight(t, f, notes_db=notes_db)} for t, f in flag_voters],
     "failed_sources": [s["title"] for s in failed],
     "review_reason": review_reason,
     "scamalytics_score": scam_score,
@@ -2390,7 +2478,9 @@ summary = {
         "unlock": notes_merged.get("unlock") or [],
     } if (notes_db or notes_merged.get("unlock")) else None,
     "ipqs_score": ipqs_score,
+    "ip2location_risk": ip2_risk,
     "ipqs_source": ipqs_src,
+    "ip2location_source": ip2_src,
     "abuseipdb": _ab_live or (
         {"score": (notes_db.get("abuseipdb") or {}).get("score"), "source": "手动"}
         if (notes_db.get("abuseipdb") or {}).get("score") is not None else None
