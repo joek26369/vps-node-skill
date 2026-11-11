@@ -25,6 +25,9 @@
 #   广播 IP、非 PBL 的 DNSBL 命中、启用源失败/超时/解析失败 → 至少复核。
 #   Spamhaus PBL（127.0.0.10/11）标为「PBL（家宽正常）」，不视为不干净。
 #   coffee 的 DNSBL 在对方服务器上查，不受本机 Clash fake-ip 干扰。
+#   主流家宽运营商加分（仅 AT&T / Verizon / Comcast）：机房票为 0 时 +1 家宽票，
+#             并让 Scamalytics 11–25 仅作参考。不加分不覆盖机房多数、代理/VPN/Tor、
+#             DNSBL、AbuseIPDB、广播、Fraud Score >25。商业线与无消费侧证据的 AS701 不加分。
 #
 # 退出码: 0 通过（可进入下一步）/ 1 需人工复核 / 3 放弃 / 2 参数错误
 #
@@ -302,6 +305,101 @@ from collections import OrderedDict
 WORKDIR = sys.argv[1]
 PBL_CODES = {"127.0.0.10", "127.0.0.11"}
 
+# ---------------------------------------------------------------------------
+# 主流家宽运营商加分表（只这三家，往下追加即可）
+#   asn_consumer: 消费/家宽 ASN，可作为加分证据（仍须过商业线检查）
+#   asn_mobile:   移动网 ASN，加分但标注「移动网络」
+#   asn_mixed:    消费与企业混跑，不能单凭 ASN 加分，必须有消费侧名称或 rDNS
+# AS701 = 原 UUNET / Verizon Business 骨干，也承载 Fios 家宽，故列入 mixed。
+# AT&T 工商注册名现为 "AT&T Enterprises, LLC"，这是法律实体名，不单独视为商业线。
+# Comcast 7015/7016 是其地区接入 ASN，不是 AT&T（AT&T 主 ASN 是 7018）。
+# ---------------------------------------------------------------------------
+OPERATORS = [
+    {
+        "brand": "Comcast",
+        "asn_consumer": [
+            7922,
+            7015, 7016,
+            7725, 11025, 13367, 13385, 14668, 16748,
+            20214, 21508, 22258, 22909, 23253, 23266, 33287,
+            33489, 33490, 33491,
+            33650, 33651, 33652, 33653, 33654, 33655, 33656, 33657,
+            33658, 33659, 33660, 33661, 33662, 33663, 33664, 33665,
+            33666, 33667, 33668,
+        ],
+        "asn_mobile": [],
+        "asn_mixed": [],
+        "name_re": r"comcast|xfinity",
+        "rdns_re": r"(?<!business\.)comcast\.net|xfinity\.com|\bhsd\d\.",
+        "consumer_re": r"xfinity|\bhsd\d\.|comcast\.net",
+        "business_re": r"comcast\s*business|comcastbusiness\.net",
+    },
+    {
+        "brand": "AT&T",
+        "asn_consumer": [7018, 6389, 7132],
+        "asn_mobile": [20057],
+        "asn_mixed": [],
+        "name_re": r"at\s*&\s*t|at\s*and\s*t|\batt\b|sbcglobal|bellsouth",
+        "rdns_re": r"sbcglobal\.net|bellsouth\.net|lightspeed|\.att\.net|phones\.att\.net",
+        "consumer_re": r"sbcglobal|bellsouth|lightspeed|private\s+customer|at\s*&\s*t\s+internet|att\s+internet|u-verse|uverse|att\.net",
+        "business_re": r"at\s*&\s*t\s+business|att\s+business|at\s*&\s*t\s+enterprise(?!s,\s*llc)|att\s+global\s+network",
+    },
+    {
+        "brand": "Verizon",
+        "asn_consumer": [19262],
+        "asn_mobile": [6167, 22394],
+        "asn_mixed": [701],
+        "name_re": r"verizon|\bfios\b|cellco|myvzw|vzwdms",
+        "rdns_re": r"fios\.verizon\.net|(?:pool-|static-|dsl-).+\.verizon\.net|(?:east|west)\.verizon\.net|myvzw\.com|vzwdms\.com",
+        "consumer_re": r"\bfios\b|verizon\s+online|verizon\s+fios|verizon\s+wireless|cellco|myvzw|vzwdms|pool-.+\.verizon\.net",
+        "business_re": r"verizon\s*business|(?<![a-z])(?:mci|uunet)(?![a-z])|uu\.net|alter\.net",
+    },
+]
+
+# 法律实体名：不当作「Enterprise/Business 产品线」
+LEGAL_ENTITY_RE = re.compile(
+    r"at\s*&\s*t\s+enterprises,?\s*llc",
+    re.I,
+)
+# 通用商业/机房产品线（品牌自己的 business_re 之外）
+GENERIC_BUSINESS_RE = re.compile(
+    r"\b(?:datacenters?|data\s*cent(?:er|re)s?|\bcloud\b|\bhosting\b)\b",
+    re.I,
+)
+MOBILE_RE = re.compile(
+    r"wireless|mobility|\bmobile\b|cellco|myvzw|vzwdms|phones\.att\.net|cellular",
+    re.I,
+)
+
+def parse_asn(val):
+    if val is None or val == "":
+        return None
+    if isinstance(val, int):
+        return val if val > 0 else None
+    s = str(val).strip()
+    m = re.search(r"\bAS:?[\s-]*([0-9]+)\b", s, re.I)
+    if m:
+        return int(m.group(1))
+    if re.fullmatch(r"[0-9]+", s):
+        return int(s)
+    return None
+
+def add_ident(s, *texts, asn=None):
+    for x in texts:
+        if x is None:
+            continue
+        xs = str(x).strip()
+        if not xs or xs.lower() in ("?", "n/a", "na", "none", "null", "-", "unknown"):
+            continue
+        s.setdefault("org_texts", []).append(xs)
+        n = parse_asn(xs)
+        if n:
+            s.setdefault("asns", []).append(n)
+    if asn is not None:
+        n = parse_asn(asn)
+        if n:
+            s.setdefault("asns", []).append(n)
+
 def read(path, default=""):
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -424,6 +522,8 @@ def add(name, title):
         "flags": [],             # list of 'vpn'/'proxy'/'tor'
         "flag_note": "",
         "hostnames": [],
+        "org_texts": [],
+        "asns": [],
         "notes": [],
     }
     return sources[name]
@@ -455,6 +555,7 @@ else:
             s["detail_lines"].append("  %s: %s" % (k, d.get(k)))
         if d.get("hostname"):
             s["hostnames"].append(d.get("hostname"))
+        add_ident(s, d.get("org"), asn=d.get("org") or d.get("asn"))
 
 # ---- IPLogs ----
 s = add("iplogs", "IPLogs")
@@ -481,6 +582,7 @@ else:
         s["detail_lines"].append(
             "  type: %s | asn: %s %s" % (typ, ii.get("asn"), ii.get("org"))
         )
+        add_ident(s, ii.get("org"), ii.get("isp"), asn=ii.get("asn"))
         for sig in (d.get("signals") or [])[:8]:
             s["detail_lines"].append(
                 "  signal: %s | weight: %s" % (sig.get("type"), sig.get("weight"))
@@ -564,6 +666,7 @@ else:
             s["detail_lines"].append("  ISP Name: %s" % isp)
         if org:
             s["detail_lines"].append("  Organization: %s" % org)
+        add_ident(s, isp, org)
         if conn:
             s["detail_lines"].append("  Connection type: %s" % conn)
         if server and server.lower() in ("yes", "true", "1"):
@@ -613,6 +716,7 @@ else:
         if d.get("rdns"):
             s["hostnames"].append(d.get("rdns"))
             s["detail_lines"].append("  rdns: %s" % d.get("rdns"))
+        add_ident(s, d.get("company_name"), d.get("asOrganization"), d.get("asname"), d.get("isp"), asn=d.get("asn"))
         s["detail_lines"].append(
             "  vpn: %s | proxy: %s | tor: %s | trust_score: %s | abuser_score: %s"
             % (d.get("is_vpn"), d.get("is_proxy"), d.get("is_tor"), d.get("trust_score"), d.get("abuser_score") or "—")
@@ -714,6 +818,7 @@ else:
             s["hostnames"].append(d["hostname"])
             s["detail_lines"].append("  hostname: %s" % d["hostname"])
         net = d.get("network") or {}
+        add_ident(s, d.get("org"), net.get("company"), asn=d.get("asn"))
         if net.get("humanPct") is not None:
             s["detail_lines"].append("  humanPct: %s%%" % net.get("humanPct"))
         ipdb = d.get("ipdb") or {}
@@ -794,6 +899,7 @@ else:
             "  isp: %s | is_proxy: %s | risk_score: %s"
             % (data.get("isp"), data.get("is_proxy"), data.get("risk_score"))
         )
+        add_ident(s, data.get("isp"), data.get("as_owner"), data.get("company"), asn=data.get("asn"))
         cu, ca, cc = classify_label(usage), classify_label(as_type), classify_label(company_type)
         votes = [v for v in (cu, ca, cc) if v]
         if "host" in votes and "res" in votes:
@@ -887,6 +993,101 @@ for h in hostnames:
     sig, _ = rdns_signal(h)
     rdns_votes.append((h, sig))
 
+def detect_operator(sources, hostnames):
+    """识别 AT&T / Verizon / Comcast。返回 dict 或 None。"""
+    # 按来源收集文本 / ASN / rDNS
+    name_items = []  # (title, text)
+    asn_items = []   # (title, asn)
+    rdns_items = []  # (title or 'rDNS', hostname)
+    for s in sources.values():
+        if not s.get("enabled") or not s.get("ok"):
+            continue
+        title = s["title"]
+        for x in s.get("org_texts") or []:
+            name_items.append((title, x))
+        for n in s.get("asns") or []:
+            asn_items.append((title, n))
+        for h in s.get("hostnames") or []:
+            rdns_items.append((title, h))
+    for h in hostnames:
+        if not any(h == x for _, x in rdns_items):
+            rdns_items.append(("rDNS", h))
+
+    def scrub(s):
+        return LEGAL_ENTITY_RE.sub("att", s or "")
+
+    all_name = " | ".join(scrub(x) for _, x in name_items)
+    all_rdns = " | ".join(h for _, h in rdns_items)
+    all_blob = all_name + " " + all_rdns
+    asns = set(n for _, n in asn_items)
+
+    def srcs_for(pred_name=None, pred_asn=None, pred_rdns=None):
+        out = []
+        if pred_name:
+            for title, x in name_items:
+                if pred_name(x) and title not in out:
+                    out.append(title)
+        if pred_asn:
+            for title, n in asn_items:
+                if pred_asn(n) and title not in out:
+                    out.append(title)
+        if pred_rdns:
+            hit_rdns = False
+            for title, h in rdns_items:
+                if pred_rdns(h):
+                    hit_rdns = True
+                    # rDNS 统一记作 rDNS，避免和同名来源重复刷屏
+                    if "rDNS" not in out:
+                        out.append("rDNS")
+            _ = hit_rdns
+        return out
+
+    best = None
+    for op in OPERATORS:
+        name_re = re.compile(op["name_re"], re.I)
+        rdns_re = re.compile(op["rdns_re"], re.I)
+        cons_re = re.compile(op["consumer_re"], re.I)
+        biz_re = re.compile(op["business_re"], re.I)
+        cons_asns = set(op["asn_consumer"])
+        mob_asns = set(op["asn_mobile"])
+        mix_asns = set(op["asn_mixed"])
+        all_op_asns = cons_asns | mob_asns | mix_asns
+
+        brand_hit = bool(name_re.search(all_blob) or (asns & all_op_asns) or rdns_re.search(all_rdns))
+        if not brand_hit:
+            continue
+
+        # 消费侧证据只看名称 / rDNS，不能单凭消费级 ASN 覆盖「Comcast Business」等产品线
+        consumer_signal = bool(cons_re.search(all_blob) or rdns_re.search(all_rdns))
+        on_consumer_asn = bool(asns & (cons_asns | mob_asns))
+        consumer = consumer_signal or on_consumer_asn
+        business = bool(biz_re.search(all_blob) or GENERIC_BUSINESS_RE.search(all_blob))
+        mobile = bool((asns & mob_asns) or MOBILE_RE.search(all_blob))
+
+        ev_sources = srcs_for(
+            pred_name=lambda x, nr=name_re, cr=cons_re, br=biz_re: nr.search(scrub(x)) or cr.search(scrub(x)) or br.search(scrub(x)),
+            pred_asn=lambda n, s=all_op_asns: n in s,
+            pred_rdns=lambda h, rr=rdns_re, cr=cons_re, br=biz_re: rr.search(h) or cr.search(h) or br.search(h),
+        )
+
+        # 明确商业产品线且没有名称/rDNS 消费侧证据 → 不加分
+        # （Fios 的组织名常写作 Verizon Business，但 rDNS 含 fios，以消费侧为准）
+        # 消费级 ASN 本身不能覆盖 comcastbusiness.net 这类产品线证据
+        if business and not consumer_signal:
+            cand = {"kind": "business", "brand": op["brand"], "sources": ev_sources, "mobile": False}
+        elif not consumer_signal and (asns & mix_asns) and not on_consumer_asn:
+            # 例如裸 AS701 + Verizon Business，没有 fios / pool rDNS
+            cand = {"kind": "business", "brand": op["brand"], "sources": ev_sources, "mobile": False}
+        elif consumer_signal or on_consumer_asn:
+            cand = {"kind": "bonus", "brand": op["brand"], "sources": ev_sources, "mobile": mobile}
+        else:
+            cand = {"kind": "business", "brand": op["brand"], "sources": ev_sources, "mobile": False}
+
+        # 若多品牌同时命中（极少见），优先 bonus，其次已选
+        if best is None or (cand["kind"] == "bonus" and best["kind"] != "bonus"):
+            best = cand
+    return best
+
 # ---------- 判定 ----------
 reject = []
 review = []
@@ -896,14 +1097,37 @@ if failed:
     names = "、".join(s["title"] + "（" + (s["error"] or "未知错误") + "）" for s in failed)
     review.append("以下启用源失败，按 fail-closed 至少需要人工复核: %s" % names)
 
-# 类型投票
-type_pass = (res_n >= 2 and res_n > host_n)
+# 主流家宽运营商加分（只加分，绝不覆盖否决项）
+op_hit = detect_operator(sources, hostnames)
+bonus_applied = False
+res_eff = res_n
+if op_hit and op_hit["kind"] == "bonus":
+    src = ", ".join(op_hit["sources"]) if op_hit["sources"] else "综合字段"
+    mob = " (移动网络)" if op_hit["mobile"] else ""
+    line = "加分: 主流家宽运营商 %s%s (来源: %s)" % (op_hit["brand"], mob, src)
+    # 仅当没有任何机房票时，加分才计为 +1 家宽票
+    if host_n == 0:
+        res_eff = res_n + 1
+        bonus_applied = True
+        line += "；机房票为 0，计为 +1 家宽票"
+    else:
+        line += "；存在机房票，只作提示、不计入类型投票"
+    notes.append(line)
+elif op_hit and op_hit["kind"] == "business":
+    notes.append("提示: 运营商为 %s 商业线，不加分" % op_hit["brand"])
+
+# 类型投票（res_eff 已含可能的运营商加分）
+type_pass = (res_eff >= 2 and res_eff > host_n)
 if host_n > res_n and host_n >= 2:
+    # 机房多数按原始票数判断，加分不得覆盖
     reject.append("类型投票：机房/IDC %d 票 vs 家宽/ISP %d 票，多数源判机房，建议放弃" % (host_n, res_n))
 elif not type_pass:
-    review.append("类型投票未通过（家宽/ISP %d 票，机房/IDC %d 票；通过需至少 2 票家宽且多于机房票）" % (res_n, host_n))
+    review.append("类型投票未通过（家宽/ISP %d 票，机房/IDC %d 票；通过需至少 2 票家宽且多于机房票）" % (res_eff, host_n))
 else:
-    notes.append("类型投票通过：家宽/ISP %d 票，机房/IDC %d 票" % (res_n, host_n))
+    if bonus_applied and res_n < 2:
+        notes.append("类型投票通过：家宽/ISP %d 票 + 主流运营商加分，机房/IDC %d 票" % (res_n, host_n))
+    else:
+        notes.append("类型投票通过：家宽/ISP %d 票，机房/IDC %d 票" % (res_n, host_n))
 
 # 代理/VPN/Tor
 if flag_sources_n >= 2:
@@ -1031,11 +1255,16 @@ for name, s in sources.items():
     print("%-16s %-6s %-8s %-16s %s" % (s["title"], status_of(s), vote, flags, extra))
 
 print()
-print("类型投票合计: 家宽/ISP %d  |  机房/IDC %d  |  投票源 %d" % (res_n, host_n, len(type_voters)))
+if bonus_applied:
+    print("类型投票合计: 家宽/ISP %d+1加分=%d  |  机房/IDC %d  |  投票源 %d" % (res_n, res_eff, host_n, len(type_voters)))
+else:
+    print("类型投票合计: 家宽/ISP %d  |  机房/IDC %d  |  投票源 %d" % (res_n, host_n, len(type_voters)))
 if type_voters:
     for title, vote, note in type_voters:
         lab = "家宽" if vote == "res" else "机房"
         print("  - %s → %s%s" % (title, lab, ("（%s）" % note) if note else ""))
+if bonus_applied:
+    print("  - 主流运营商加分 → 家宽（+1，%s）" % op_hit["brand"])
 
 print()
 print("判定依据:")

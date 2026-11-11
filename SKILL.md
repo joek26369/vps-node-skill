@@ -429,6 +429,7 @@ curl -s --max-time 12 -x "socks5h://<user>:<pass>@<host>:<port>" "http://ip-api.
 | 指标 | 通过 | 复核 | 放弃 |
 |---|---|---|---|
 | 类型投票（coffee / ipx.al / iping / IPLogs / Scamalytics Server） | ≥ 2 个独立源判 ISP/家宽，且机房票不成多数 | 家宽票不足 2，或与机房票打平 | 机房/IDC 票占多数 |
+| 主流家宽运营商加分（仅 AT&T / Verizon / Comcast） | 加分不是否决。机房票为 0 时计为 +1 家宽票，并让 Scamalytics 11–25 仅作参考 | — | 不覆盖机房多数、代理/VPN/Tor、DNSBL、AbuseIPDB、广播、Fraud Score >25。商业线（Comcast Business、无消费侧证据的 Verizon Business/UUNET 等）不加分；AS701 需 fios 等消费侧证据。移动网加分但标注「移动网络」 |
 | 代理 / VPN / Tor | 全部无 | 单源阳性 | ≥ 2 个源阳性 |
 | Scamalytics Fraud Score | —（≤10 低风险参考） | 11–25 **仅作参考**：类型投票明确为家宽且标志干净时，不单独触发复核 | > 25 |
 | IPLogs verdict | `clean` | 其它值 | — |
