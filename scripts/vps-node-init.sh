@@ -42,7 +42,12 @@ echo "  cc=$(sysctl -n net.ipv4.tcp_congestion_control)"
 
 # 3. sing-box 最新版
 echo "=== [3/8] sing-box ==="
-ARCH=$(uname -m); [ "$ARCH" = "x86_64" ] && SARCH="amd64" || SARCH="arm64"
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64|amd64)  SARCH="amd64" ;;
+  aarch64|arm64) SARCH="arm64" ;;
+  *) echo "FATAL: 不支持的架构 $ARCH"; exit 1 ;;
+esac
 VER=$(curl -s --max-time 15 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" \
       | grep -o '"tag_name": *"v[^"]*"' | cut -d'"' -f4 | sed 's/v//' || true)
 if [ -z "${VER:-}" ]; then
@@ -52,7 +57,7 @@ if [ -z "${VER:-}" ]; then
 fi
 [ -n "${VER:-}" ] || { echo "FATAL: 无法确定 sing-box 版本"; exit 1; }
 echo "  version=$VER arch=$SARCH"
-curl -sL --max-time 180 "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${SARCH}.tar.gz" -o /tmp/sb.tgz
+curl -fsSL --max-time 180 "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${SARCH}.tar.gz" -o /tmp/sb.tgz
 tar -xzf /tmp/sb.tgz -C /tmp
 install -m 755 /tmp/sing-box-*/sing-box /usr/local/bin/sing-box
 rm -rf /tmp/sb.tgz /tmp/sing-box-*
@@ -74,6 +79,9 @@ echo "  uuid=$UUID  short_id=$SHORTID  pub=${PUB:0:12}..."
 
 # 5. sing-box 配置（REALITY + Hy2）
 echo "=== [5/8] sing-box 配置 ==="
+# 配置含 REALITY 私钥 / Hy2 密码，只给 root 读
+( umask 077; : > /etc/sing-box/config.json )
+chmod 600 /etc/sing-box/config.json /etc/sing-box/hy2.key
 cat > /etc/sing-box/config.json <<EOF
 {
   "log": { "level": "warn", "timestamp": true },
@@ -116,11 +124,38 @@ cat > /etc/sing-box/config.json <<EOF
 }
 EOF
 /usr/local/bin/sing-box check -c /etc/sing-box/config.json && echo "  config OK"
-systemctl restart sing-box
+# tar.gz 发行包只有二进制，没有 systemd unit；不存在就补一个
+if [ ! -f /etc/systemd/system/sing-box.service ] && [ ! -f /lib/systemd/system/sing-box.service ] \
+   && [ ! -f /usr/lib/systemd/system/sing-box.service ]; then
+  cat > /etc/systemd/system/sing-box.service <<'UNIT'
+[Unit]
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+fi
+systemctl daemon-reload
 systemctl enable sing-box >/dev/null 2>&1
+systemctl restart sing-box
 
 # 6. Clash 订阅 YAML
 echo "=== [6/8] Clash YAML ==="
+# 重跑时清掉旧 token 的订阅文件，避免新链接返回旧凭据
+rm -f "$SUBDIR"/*.yaml
+( umask 077; : > "$SUBDIR/${SUBTOKEN}.yaml" )
 cat > "$SUBDIR/${SUBTOKEN}.yaml" <<EOF
 # ${FQDN} (${VIP}) — REALITY + Hysteria2, mihomo / Clash Verge
 proxies:
@@ -179,26 +214,28 @@ export DuckDNS_Token="$DTOKEN"
 cat > /opt/serve_sub_https.py <<'PYEOF'
 #!/usr/bin/env python3
 """Token-path-only HTTPS subscription server (TLS 1.2+)."""
-import http.server, ssl, sys, os
+import http.server, ssl, sys, os, hmac
 
 TOKEN = sys.argv[1]; CERT = sys.argv[2]; KEY = sys.argv[3]
 PORT = int(sys.argv[4]) if len(sys.argv) > 4 else 2096
 SUB_PATH = os.environ.get("SUB_PATH", "/opt/vps-sub")
+HANDSHAKE_TIMEOUT = 10
 
-def pick_subfile():
-    try:
-        for f in sorted(os.listdir(SUB_PATH)):
-            if f.endswith(".yaml"):
-                return os.path.join(SUB_PATH, f)
-    except FileNotFoundError:
-        pass
-    return None
+def subfile():
+    f = os.path.join(SUB_PATH, f"{TOKEN}.yaml")
+    return f if os.path.isfile(f) else None
 
 class H(http.server.BaseHTTPRequestHandler):
+    timeout = 15          # 每连接读超时，防止慢连接占线程
+    def setup(self):
+        # 握手放到各自的处理线程里做，并加超时：一个空连接不会卡住 accept
+        self.request.settimeout(HANDSHAKE_TIMEOUT)
+        self.request.do_handshake()
+        super().setup()
     def do_GET(self):
         path = self.path.split("?")[0]
-        f = pick_subfile()
-        if path == f"/{TOKEN}.yaml" and f:
+        f = subfile()
+        if hmac.compare_digest(path, f"/{TOKEN}.yaml") and f:
             data = open(f, "rb").read()
             self.send_response(200)
             self.send_header("Content-Type", "text/yaml; charset=utf-8")
@@ -215,8 +252,13 @@ class H(http.server.BaseHTTPRequestHandler):
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(CERT, KEY)
 ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-srv = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), H)
-srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+class S(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    def handle_error(self, request, client_address):
+        pass              # 握手失败 / 超时属常态（扫描器），不刷 traceback
+
+srv = S(("0.0.0.0", PORT), H)
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
 print(f"HTTPS sub server on :{PORT}", flush=True)
 srv.serve_forever()
 PYEOF
@@ -250,7 +292,9 @@ echo "sub-https: $SH"
 ss -tlnp | grep -E ':(443|2096) ' | awk '{print "  listen:", $4}' || true
 SUBJ=$(echo | timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$DEST" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || echo "check failed")
 echo "  443 REALITY 借壳证书: $(echo "$SUBJ" | head -c 100)"
-SUBCODE=$(curl -s --max-time 12 "https://${FQDN}:2096/${SUBTOKEN}.yaml" -o /dev/null -w "%{http_code}" || echo "000")
+SUBCODE=$(curl -s --max-time 12 "https://${FQDN}:2096/${SUBTOKEN}.yaml" -o /dev/null -w "%{http_code}" 2>/dev/null || true)
+case "$SUBCODE" in [0-9][0-9][0-9]) ;; *) SUBCODE=000 ;; esac
+SUBCODE=$((10#$SUBCODE))   # 去前导零，保证 JSON 合法（000 -> 0）
 echo "  https 订阅自取: HTTP $SUBCODE"
 
 SUBURL="https://${FQDN}:2096/${SUBTOKEN}.yaml"
@@ -262,4 +306,4 @@ echo "Hy2      : ${VIP}:8443  password=${HY2PASS}"
 echo "========================================="
 # 机读结果（编排器解析此行）
 printf 'VPS_RESULT_JSON={"ip":"%s","fqdn":"%s","sub_url":"%s","uuid":"%s","reality_pub":"%s","short_id":"%s","dest":"%s","hy2_pass":"%s","singbox":"%s","subsvc":"%s","sub_http":%s}\n' \
-  "$VIP" "$FQDN" "$SUBURL" "$UUID" "$PUB" "$SHORTID" "$DEST" "$HY2PASS" "$SB" "$SH" "${SUBCODE:-0}"
+  "$VIP" "$FQDN" "$SUBURL" "$UUID" "$PUB" "$SHORTID" "$DEST" "$HY2PASS" "$SB" "$SH" "$SUBCODE"
